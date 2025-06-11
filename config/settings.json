@@ -1,0 +1,52 @@
+{
+    "window": {
+        "target_titles": [
+            "World of Warcraft",
+            "World of Warcraft®",
+            "Retail"
+        ],
+        "capture_fps": 10,
+        "screenshot_format": "png"
+    },
+    "input": {
+        "click_delay": 0.1,
+        "safety_enabled": true,
+        "failsafe_enabled": true,
+        "default_key_method": "winapi"
+    },
+    "gui": {
+        "preview_fps": 5,
+        "preview_max_width": 400,
+        "preview_max_height": 300,
+        "window_width": 900,
+        "window_height": 700
+    },
+    "paths": {
+        "screenshots": "data/screenshots",
+        "templates": "data/templates",
+        "models": "models",
+        "database": "data/training_data.db"
+    },
+    "vision": {
+        "template_confidence_threshold": 0.8,
+        "health_bar_colors": {
+            "red_lower1": [0, 50, 50],
+            "red_upper1": [10, 255, 255],
+            "red_lower2": [170, 50, 50],
+            "red_upper2": [180, 255, 255]
+        },
+        "mana_bar_colors": {
+            "blue_lower": [100, 50, 50],
+            "blue_upper": [130, 255, 255]
+        },
+        "ocr": {
+            "numbers_config": "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789%/",
+            "text_config": "--oem 3 --psm 6",
+            "preprocessing": {
+                "scale_factor": 3,
+                "contrast_alpha": 3.0,
+                "contrast_beta": 50
+            }
+        }
+    }
+}
