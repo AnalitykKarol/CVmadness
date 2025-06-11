@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image, ImageTk
 from capture.window_capture import WindowCapture
 from input.input_controller import InputController
-
+from ..automation.automation_manager import AutomationManager
 
 class MainWindow:
     """Główne okno aplikacji"""
@@ -21,7 +21,11 @@ class MainWindow:
         self.config = config
         self.root = tk.Tk()
         self.root.title("WoW Automation - Computer Vision")
+        self.config = config
+        self.vision_engine = VisionEngine()
 
+        # Initialize automation
+        self.automation = AutomationManager(config, self.vision_engine)
         gui_config = config['gui']
         self.root.geometry(f"{gui_config['window_width']}x{gui_config['window_height']}")
 
@@ -1399,7 +1403,11 @@ KLAWISZE:
 
     def run(self):
         """Uruchom aplikację"""
+
         try:
+            # Start automation if enabled
+            if self.config['automation']['enabled']:
+                self.automation.start()
             from vision.vision_engine import VisionEngine
             self.vision_engine = VisionEngine(self.config)
             self.update_template_list()
@@ -1408,3 +1416,7 @@ KLAWISZE:
 
         self.root.mainloop()
         self.stop_capture()
+        finally:
+            # Clean up
+            if self.automation:
+                self.automation.stop()

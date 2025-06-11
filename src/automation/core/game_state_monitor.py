@@ -133,7 +133,30 @@ class GameStateMonitor:
         self.max_consecutive_errors = 10
 
         logging.info("GameStateMonitor initialized")
+        self.resource_callbacks: List[Callable[[Resources], None]] = []
 
+    def add_resource_callback(self, callback: Callable[[Resources], None]):
+        """Add a callback that will be called when resources change"""
+        self.resource_callbacks.append(callback)
+
+    def _update_game_state(self):
+        """Aktualizuj stan gry"""
+        with self._lock:
+            # ... existing state update code ...
+
+            if self.monitoring_enabled['resources']:
+                new_resources = self._read_player_resources()
+                # Check if resources changed
+                if (new_resources.health_current != self.current_state.resources.health_current or
+                        new_resources.mana_current != self.current_state.resources.mana_current):
+                    # Call resource callbacks
+                    for callback in self.resource_callbacks:
+                        try:
+                            callback(new_resources)
+                        except Exception as e:
+                            logging.error(f"Resource callback error: {e}")
+
+                new_state.resources = new_resources
     # ===============================
     # CORE MONITORING METHODS
     # ===============================

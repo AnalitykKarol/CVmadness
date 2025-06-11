@@ -58,7 +58,61 @@ def get_default_config():
         }
     }
 
-
+def get_default_config():
+    """Domyślna konfiguracja"""
+    return {
+        "window": {
+            "target_titles": [
+                "WowClassic",
+                "World of Warcraft",
+                "World of Warcraft®",
+                "Retail"
+            ],
+            "capture_fps": 10,
+            "screenshot_format": "png"
+        },
+        "input": {
+            "click_delay": 0.1,
+            "safety_enabled": True,
+            "failsafe_enabled": True
+        },
+        "gui": {
+            "preview_fps": 5,
+            "preview_max_width": 400,
+            "preview_max_height": 300,
+            "window_width": 800,
+            "window_height": 600
+        },
+        "paths": {
+            "screenshots": "data/screenshots",
+            "templates": "data/templates",
+            "models": "models",
+            "database": "data/training_data.db"
+        },
+        # Add automation configuration
+        "automation": {
+            "enabled": True,
+            "monitoring": {
+                "update_interval": 0.2,
+                "resources": True,
+                "target": True,
+                "combat": True,
+                "buffs": True
+            },
+            "resources": {
+                "health": {
+                    "enabled": True,
+                    "threshold": 30.0,
+                    "cooldown": 10.0
+                },
+                "mana": {
+                    "enabled": True,
+                    "threshold": 20.0,
+                    "cooldown": 10.0
+                }
+            }
+        }
+    }
 def create_directories(config):
     """Utwórz potrzebne foldery"""
     base_path = src_path.parent
