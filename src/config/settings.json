@@ -1,0 +1,133 @@
+{
+    "window": {
+        "target_titles": [
+            "World of Warcraft",
+            "World of Warcraft®",
+            "Retail"
+        ],
+        "capture_fps": 10,
+        "screenshot_format": "png"
+    },
+    "input": {
+        "click_delay": 0.1,
+        "safety_enabled": true,
+        "failsafe_enabled": true,
+        "default_key_method": "winapi"
+    },
+    "gui": {
+        "preview_fps": 5,
+        "preview_max_width": 400,
+        "preview_max_height": 300,
+        "window_width": 900,
+        "window_height": 700
+    },
+    "paths": {
+        "screenshots": "data/screenshots",
+        "templates": "data/templates",
+        "models": "models",
+        "database": "data/training_data.db"
+    },
+    "ocr_regions": {
+        "hp_region": [270, 125, 50, 29],
+        "mana_region": [270, 147, 50, 29]
+    },
+    "vision": {
+        "template_confidence_threshold": 0.8,
+        "health_bar_colors": {
+            "red_lower1": [0, 50, 50],
+            "red_upper1": [10, 255, 255],
+            "red_lower2": [170, 50, 50],
+            "red_upper2": [180, 255, 255]
+        },
+        "mana_bar_colors": {
+            "blue_lower": [100, 50, 50],
+            "blue_upper": [130, 255, 255]
+        },
+        "resource_regions": {
+            "player_hp_bar": {
+                "x": 270,
+                "y": 125,
+                "width": 50,
+                "height": 29
+            },
+            "player_mana_bar": {
+                "x": 270,
+                "y": 147,
+                "width": 50,
+                "height": 29
+            }
+        },
+        "ocr": {
+            "regions": {
+                "hp": {
+                    "x": 270,
+                    "y": 125,
+                    "width": 50,
+                    "height": 24
+                },
+                "mana": {
+                    "x": 270,
+                    "y": 147,
+                    "width": 50,
+                    "height": 24
+                }
+            },
+            "numbers_config": "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789%",
+            "text_config": "--oem 3 --psm 7",
+            "preprocessing": {
+                "scale_factor": 4,
+                "contrast_alpha": 4.0,
+                "contrast_beta": 60
+            }
+        }
+    },
+    "automation": {
+      "combat": {
+        "enabled": true,
+        "target_range": 50,
+        "attack_cooldown": 1.0,
+        "movement_keys": {
+          "forward": "w",
+          "backward": "s",
+          "left": "a",
+          "right": "d"
+    },
+        "monitoring": {
+            "update_interval": 0.2,
+            "resources": true,
+            "target": true,
+            "combat": true,
+            "buffs": true
+        },
+        "resources": {
+            "enabled": true,
+            "update_interval": 0.2,
+            "hp": {
+                "enabled": true,
+                "threshold": 30.0,
+                "cooldown": 10.0,
+                "region": {
+                    "x": 270,
+                    "y": 125,
+                    "width": 50,
+                    "height": 29
+                }
+            },
+            "mana": {
+                "enabled": true,
+                "threshold": 20.0,
+                "cooldown": 10.0,
+                "region": {
+                    "x": 270,
+                    "y": 147,
+                    "width": 50,
+                    "height": 29
+                }
+            }
+        }
+    },
+    "metadata": {
+        "last_updated": "2025-06-11 16:59:14",
+        "user": "AnalitykKarol"
+    }
+}

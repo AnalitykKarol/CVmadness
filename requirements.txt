@@ -6,3 +6,32 @@ mss>=6.1.0
 numpy>=1.21.0
 pytesseract>=0.3.10
 pywin32
+ultralytics
+
+# YOLOv5 dependencies
+yolov5
+torch>=1.7.0
+torchvision>=0.8.0
+matplotlib>=3.2.2
+seaborn>=0.11.0
+thop>=0.1.1
+tensorboard>=2.4.0
+pandas>=1.1.4
+pyyaml>=5.3.1
+requests>=2.23.0
+scipy>=1.4.1
+tqdm>=4.64.0
+
+# Additional ML/CV libraries
+scikit-learn>=1.0.0
+imageio>=2.9.0
+
+# GUI and system
+tkinter  # Usually included with Python
+pathlib  # Built-in since Python 3.4
+
+# Optional but useful
+psutil>=5.8.0  # For system monitoring
+logging  # Built-in
+json  # Built-in
+datetime  # Built-in

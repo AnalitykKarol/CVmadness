@@ -8,7 +8,7 @@ import threading
 import logging
 from typing import Callable, List, Optional, Dict, Any
 from collections import deque
-
+from dataclasses import dataclass
 from .data_structures import (
     GameState, Resources, Target, Position, Buff, CombatState,
     calculate_state_diff, merge_game_states
@@ -132,12 +132,33 @@ class GameStateMonitor:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 10
 
+        # Input controller
+        self.input_controller = None
+
         logging.info("GameStateMonitor initialized")
         self.resource_callbacks: List[Callable[[Resources], None]] = []
+
+    def set_input_controller(self, input_controller):
+        """Set the input controller instance"""
+        self.input_controller = input_controller
+
+    def get_input_controller(self):
+        """Get the input controller instance"""
+        return self.input_controller
 
     def add_resource_callback(self, callback: Callable[[Resources], None]):
         """Add a callback that will be called when resources change"""
         self.resource_callbacks.append(callback)
+
+    def is_game_window_active(self) -> bool:
+        """Sprawdź, czy okno gry jest aktywne"""
+        try:
+            # Próba przechwycenia małego fragmentu ekranu
+            # Jeśli się nie uda, oznacza to, że okno gry nie jest aktywne
+            self.vision_engine.capture_region(0, 0, 1, 1)
+            return True
+        except Exception:
+            return False
 
     def _update_game_state(self):
         """Aktualizuj stan gry"""
@@ -178,7 +199,9 @@ class GameStateMonitor:
             )
             self.monitor_thread.start()
 
-            logging.info("Game state monitoring started")
+            logging.info("=== Game State Monitoring Started ===")
+            logging.info(f"Update interval: {self.update_interval}s")
+            logging.info(f"Monitoring enabled: {self.monitoring_enabled}")
             return True
 
         except Exception as e:
@@ -198,15 +221,23 @@ class GameStateMonitor:
             if self.monitor_thread.is_alive():
                 logging.warning("Monitor thread did not stop gracefully")
 
-        logging.info("Game state monitoring stopped")
+        logging.info("=== Game State Monitoring Stopped ===")
 
     def _monitoring_loop(self):
         """Główna pętla monitorowania"""
         last_update_time = time.time()
         update_count = 0
 
+        logging.info("Monitoring loop started")
+        
         while self.is_running:
             try:
+                # Sprawdź, czy okno gry jest aktywne
+                if not self.is_game_window_active():
+                    logging.info("Game window is not active, waiting...")
+                    time.sleep(1.0)  # Czekaj sekundę przed następną próbą
+                    continue
+
                 start_time = time.time()
 
                 # Update game state
@@ -219,9 +250,12 @@ class GameStateMonitor:
                 # Update performance stats every second
                 if (start_time - last_update_time) >= 1.0:
                     time_diff = start_time - last_update_time
-                    self.performance_stats['updates_per_second'] = update_count / time_diff
+                    updates_per_second = update_count / time_diff
+                    self.performance_stats['updates_per_second'] = updates_per_second
                     self.performance_stats['avg_processing_time'] = processing_time
                     self.performance_stats['last_update_time'] = start_time
+
+                    logging.debug(f"Performance: {updates_per_second:.1f} updates/s, {processing_time*1000:.1f}ms per update")
 
                     last_update_time = start_time
                     update_count = 0
@@ -265,22 +299,29 @@ class GameStateMonitor:
             # Update components based on enabled monitoring
             if self.monitoring_enabled['resources']:
                 new_state.resources = self._read_player_resources()
+                logging.debug(f"Resources updated - Health: {new_state.resources.health_percent:.1f}%, Mana: {new_state.resources.mana_percent:.1f}%")
 
             if self.monitoring_enabled['target']:
                 new_state.target = self._read_target_info()
+                if new_state.target.exists:
+                    logging.debug(f"Target updated - {new_state.target.name} ({new_state.target.hp_percent:.1f}% HP)")
 
             if self.monitoring_enabled['combat']:
                 new_state.combat_state = self._detect_combat_state()
                 new_state.in_combat = new_state.combat_state == CombatState.COMBAT
                 new_state.is_casting = self._detect_casting()
+                if new_state.in_combat:
+                    logging.debug("Combat state: IN COMBAT")
+                if new_state.is_casting:
+                    logging.debug("Player is casting")
 
             if self.monitoring_enabled['buffs']:
                 new_state.buffs = self._read_buffs()
                 new_state.debuffs = self._read_debuffs()
-
-            if self.monitoring_enabled['environment']:
-                new_state.is_resting = self._detect_resting()
-                new_state.zone_name = self._read_zone_name()
+                if new_state.buffs:
+                    logging.debug(f"Active buffs: {len(new_state.buffs)}")
+                if new_state.debuffs:
+                    logging.debug(f"Active debuffs: {len(new_state.debuffs)}")
 
             # Merge with previous state to preserve data
             self.current_state = merge_game_states(self.current_state, new_state)

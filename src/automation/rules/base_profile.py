@@ -1,4 +1,4 @@
-# src/automation/profiles/base_profile.py
+# src/automation/profile/base_profile.py
 """
 Klasa bazowa dla profili klas - łączy akcje, reguły i konfigurację dla konkretnej klasy
 """

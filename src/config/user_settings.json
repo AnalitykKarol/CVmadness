@@ -1,36 +1,35 @@
 {
-  "target_window": "World of Warcraft",
-  "ocr_regions": {
-    "current": {
-      "x": 210,
-      "y": 106,
-      "w": 70,
-      "h": 20
+    "target_window": "World of Warcraft",
+    "ocr_regions": {
+        "current": {
+            "x": 270,
+            "y": 125,
+            "w": 50,
+            "h": 24
+        },
+        "hp": [
+            270,
+            125,
+            50,
+            24
+        ],
+        "mana": [
+            270,
+            148,
+            50,
+            24
+        ]
     },
-    "hp_region": [
-      210,
-      106,
-      70,
-      20
-    ],
-    "mana_region": [
-      210,
-      123,
-      60,
-      20
-    ]
-  },
-  "color_regions": {
-    "current": {
-      "x": 150,
-      "y": 70,
-      "region_x": 100,
-      "region_y": 60,
-      "region_w": 200,
-      "region_h": 50,
-      "tolerance": 15
-    }
-  },
-  "saved_colors": {},
-  "current_picked_color": null
+    "color_regions": {
+        "current": {
+            "x": 150,
+            "y": 70,
+            "region_x": 100,
+            "region_y": 60,
+            "region_w": 200,
+            "region_h": 50,
+            "tolerance": 15
+        }
+    },
+    "saved_colors": {}
 }

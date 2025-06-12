@@ -2,10 +2,15 @@
 import cv2
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
+from datetime import datetime
 
 from vision.template_matcher import TemplateMatcher
+from .detectors.monster_detector import MonsterDetector
 
 import os
+import logging
+import json
+from pathlib import Path
 
 try:
     import pytesseract
@@ -38,115 +43,578 @@ try:
 except ImportError:
     print("⚠ pytesseract nie zainstalowany")
 
+
 class VisionEngine:
     """Główny silnik computer vision dla WoW"""
 
-    # Dodaj te metody do klasy VisionEngine w src/vision/vision_engine.py
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.template_matcher = TemplateMatcher(config)
 
+        # Wczytaj zapisane lokalizacje OCR
+        self.ocr_regions = self.load_ocr_regions()
+
+        # Inicjalizacja OCR
+        self.ocr_available = False
+        self.ocr_config = '--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789/%'  # Zmieniono PSM na 7
+        self.ocr_config_text = '--oem 3 --psm 6'  # Pełny tekst
+        model_path = r"/models/yolo_models\monsters.pt"
+        self.monster_detector = MonsterDetector(model_path, confidence_threshold=0.5)
+        try:
+            import pytesseract
+            # Sprawdź typowe lokalizacje Tesseract na Windows
+            tesseract_paths = [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            ]
+
+            # Dodaj WinGet paths
+            username = os.environ.get('USERNAME', '')
+            winget_base = rf'C:\Users\{username}\AppData\Local\Microsoft\WinGet\Packages'
+
+            if os.path.exists(winget_base):
+                for folder in os.listdir(winget_base):
+                    if 'tesseract' in folder.lower():
+                        tesseract_exe = os.path.join(winget_base, folder, 'tesseract.exe')
+                        tesseract_paths.append(tesseract_exe)
+
+            # Znajdź działający Tesseract
+            for path in tesseract_paths:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    logging.info(f"✓ Tesseract znaleziony: {path}")
+                    self.ocr_available = True
+                    break
+            else:
+                logging.warning("⚠ Tesseract nie znaleziony w standardowych lokalizacjach")
+
+        except ImportError:
+            logging.error("⚠ pytesseract nie zainstalowany - zainstaluj: pip install pytesseract")
+        except Exception as e:
+            logging.error(f"⚠ OCR problem: {e}")
+
+        if self.ocr_available:
+            logging.info("✓ OCR (Tesseract) skonfigurowany i gotowy do użycia")
+    def detect_monsters(self, image):
+        """Detect monsters in image"""
+        return self.monster_detector.detect_monsters(image)
     def _preprocess_for_wow_numbers(self, image: np.ndarray) -> np.ndarray:
-        """Specjalny preprocessing dla liczb WoW"""
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
+        """Optymalizowany preprocessing dla małych regionów z liczbami WoW"""
+        try:
+            # 1. Konwersja do skali szarości - standardowa metoda
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
 
-        # WoW ma białe liczby z czarnymi cieniami - zwiększ kontrast
-        # Bardzo duże skalowanie dla małych liczb
-        height, width = gray.shape
-        scale_factor = 5  # Większe skalowanie
-        resized = cv2.resize(gray, (width * scale_factor, height * scale_factor), interpolation=cv2.INTER_CUBIC)
+            # 2. NAJPIERW zwiększ rozmiar - kluczowe dla małych regionów!
+            scale = 6  # Większe skalowanie dla bardzo małych regionów
+            height, width = gray.shape
+            enlarged = cv2.resize(gray, (width * scale, height * scale),
+                                  interpolation=cv2.INTER_CUBIC)
 
-        # Bardzo wysokie zwiększenie kontrastu dla białego tekstu
-        contrast = cv2.convertScaleAbs(resized, alpha=4.0, beta=0)
+            # 3. Delikatna normalizacja (nie za agresywna)
+            normalized = cv2.normalize(enlarged, None, 0, 255, cv2.NORM_MINMAX)
 
-        # Próg adaptacyjny - lepszy dla różnych tła
-        thresh = cv2.adaptiveThreshold(contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            # 4. Zmniejszony kontrast - dla białych liczb WoW
+            alpha = 1.8  # Zmniejszono z 4.0
+            beta = 40  # Zwiększono z 30
+            contrast = cv2.convertScaleAbs(normalized, alpha=alpha, beta=beta)
 
-        # Morphological operations - poprawa jakości tekstu
-        kernel = np.ones((2, 2), np.uint8)
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            # 5. Bardzo delikatne rozmycie dla wygładzenia pikseli
+            blurred = cv2.GaussianBlur(contrast, (3, 3), 0)
 
-        return cleaned
+            # 6. Dla białego tekstu na ciemnym tle - użyj prostego threshold
+            # Biały tekst WoW ma zwykle wysokie wartości (200+)
+            _, thresh = cv2.threshold(blurred, 180, 255, cv2.THRESH_BINARY)
 
-    def extract_wow_hp_mana_text(self, image: np.ndarray) -> Dict[str, Any]:
-        """Specjalna metoda dla liczb HP/Mana w WoW"""
+            # 7. Minimalna morfologia - tylko jeśli potrzebna
+            kernel = np.ones((2, 2), np.uint8)
+            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+            # 8. Dodaj białe obramowanie dla lepszego OCR
+            bordered = cv2.copyMakeBorder(cleaned, 15, 15, 15, 15,
+                                          cv2.BORDER_CONSTANT, value=0)
+
+            return bordered
+
+        except Exception as e:
+            logging.error(f"Błąd podczas przetwarzania obrazu: {e}")
+            return image
+
+    def test_manual_ocr_region(self, image: np.ndarray, x: int, y: int, w: int, h: int) -> Dict[str, str]:
+        """Test OCR w ręcznie wybranym regionie - KOMPATYBILNOŚĆ z auto-detekcją"""
         if not self.ocr_available:
-            return {'hp_text': [], 'mana_text': []}
+            logging.error("OCR nie jest dostępny")
+            return {'error': 'OCR nie jest dostępny'}
+
+        # === PEŁNA WALIDACJA ===
+        if image is None:
+            logging.error("test_manual_ocr_region: Otrzymano None jako obraz")
+            return {'error': 'Image is None'}
+
+        if image.size == 0:
+            logging.error("test_manual_ocr_region: Otrzymano pusty obraz")
+            return {'error': 'Image is empty'}
+
+        # Sprawdź rozmiary obrazu
+        try:
+            img_height, img_width = image.shape[:2]
+        except Exception as e:
+            logging.error(f"test_manual_ocr_region: Nie można odczytać kształtu obrazu: {e}")
+            return {'error': f'Cannot read image shape: {e}'}
+
+        logging.info(f"test_manual_ocr_region: Obraz {img_width}x{img_height}, region ({x},{y},{w},{h})")
+
+        # === AUTO-DETEKCJA: CZY TO PEŁNY OBRAZ CZY WYCIĘTY REGION ===
+        expected_region_size = w * h
+        image_size = img_width * img_height
+
+        # Jeśli obraz jest mały i podobny do rozmiaru regionu, to prawdopodobnie już wycięty
+        if img_width <= w + 10 and img_height <= h + 10:
+            logging.info(f"test_manual_ocr_region: Wykryto już wycięty region. Używam całego obrazu.")
+            roi = image  # Użyj całego obrazu jako ROI
+        else:
+            # Normalny tryb - wytnij region z większego obrazu
+            # Sprawdź czy region mieści się w obrazie
+            if x < 0 or y < 0:
+                logging.error(f"test_manual_ocr_region: Negatywne współrzędne: ({x},{y})")
+                return {'error': f'Negative coordinates: ({x},{y})'}
+
+            if w <= 0 or h <= 0:
+                logging.error(f"test_manual_ocr_region: Nieprawidłowy rozmiar regionu: {w}x{h}")
+                return {'error': f'Invalid region size: {w}x{h}'}
+
+            if x + w > img_width or y + h > img_height:
+                logging.error(
+                    f"test_manual_ocr_region: Region wykracza poza obraz. Region: ({x},{y},{w},{h}), Obraz: {img_width}x{img_height}")
+                return {
+                    'error': f'Region outside image bounds. Region: ({x},{y},{w},{h}), Image: {img_width}x{img_height}'}
+
+            # Wytnij region z dodatkowymi sprawdzeniami
+            try:
+                roi = image[y:y + h, x:x + w]
+            except Exception as e:
+                logging.error(f"test_manual_ocr_region: Błąd podczas wycinania regionu: {e}")
+                return {'error': f'Error cutting region: {e}'}
+
+        if roi is None:
+            logging.error("test_manual_ocr_region: ROI jest None")
+            return {'error': 'ROI is None'}
+
+        if roi.size == 0:
+            logging.error("test_manual_ocr_region: ROI jest pusty")
+            return {'error': 'ROI is empty'}
+
+        logging.info(f"test_manual_ocr_region: ROI rozmiar: {roi.shape}")
 
         try:
             import pytesseract
 
-            # Zakresy gdzie WoW zwykle pokazuje HP/Mana (górny lewy róg)
-            player_hp_region = (80, 80, 120, 25)  # Region z HP gracza
-            player_mana_region = (80, 105, 120, 25)  # Region z maną gracza
+            # Przetwórz obraz z dodatkową walidacją
+            try:
+                processed = self._preprocess_for_wow_numbers_safe(roi)
+            except Exception as e:
+                logging.error(f"test_manual_ocr_region: Błąd podczas preprocessingu: {e}")
+                return {'error': f'Preprocessing error: {e}'}
 
-            # Config OCR dla WoW (tylko cyfry, /, %)
-            wow_config = '--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789/%'
+            if processed is None:
+                logging.error("test_manual_ocr_region: Processed image jest None")
+                return {'error': 'Processed image is None'}
 
-            results = {'hp_text': [], 'mana_text': []}
+            if processed.size == 0:
+                logging.error("test_manual_ocr_region: Processed image jest pusty")
+                return {'error': 'Processed image is empty'}
 
-            # Test różnych regionów gdzie mogą być liczby HP/Mana
-            test_regions = [
-                ('hp', player_hp_region),
-                ('mana', player_mana_region),
-                # Dodatkowe regiony dla targetów, party itp.
-                ('target_hp', (400, 80, 120, 25)),
-                ('party1_hp', (20, 200, 80, 20)),
-            ]
+            # Testuj różne konfiguracje OCR
+            results = {}
 
-            for region_type, (x, y, w, h) in test_regions:
-                # Sprawdź czy region mieści się w obrazie
-                if x + w > image.shape[1] or y + h > image.shape[0]:
-                    continue
+            # Test 1: Tylko cyfry i /
+            try:
+                text = pytesseract.image_to_string(processed, config=self.ocr_config).strip()
+                results['numbers_only'] = text
+                logging.info(f"OCR (numbers_only): '{text}'")
+            except Exception as e:
+                logging.error(f"Błąd OCR (numbers_only): {e}")
+                results['numbers_only'] = f"Error: {e}"
 
-                roi = image[y:y + h, x:x + w]
+            # Test 2: Pełny tekst
+            try:
+                text = pytesseract.image_to_string(processed, config=self.ocr_config_text).strip()
+                results['full_text'] = text
+                logging.info(f"OCR (full_text): '{text}'")
+            except Exception as e:
+                logging.error(f"Błąd OCR (full_text): {e}")
+                results['full_text'] = f"Error: {e}"
 
-                # Specjalny preprocessing dla WoW
-                processed = self._preprocess_for_wow_numbers(roi)
-
-                try:
-                    text = pytesseract.image_to_string(processed, config=wow_config).strip()
-
-                    # Sprawdź czy tekst wygląda jak HP/Mana (zawiera cyfry)
-                    if text and any(c.isdigit() for c in text):
-                        result = {
-                            'type': region_type,
-                            'text': text,
-                            'x': x, 'y': y, 'width': w, 'height': h,
-                            'confidence': self._calculate_wow_text_confidence(text)
-                        }
-
-                        if 'hp' in region_type:
-                            results['hp_text'].append(result)
-                        elif 'mana' in region_type:
-                            results['mana_text'].append(result)
-
-                except Exception as e:
-                    print(f"OCR error dla {region_type}: {e}")
+            # Test 3: Bez konfiguracji
+            try:
+                text = pytesseract.image_to_string(processed).strip()
+                results['default'] = text
+                logging.info(f"OCR (default): '{text}'")
+            except Exception as e:
+                logging.error(f"Błąd OCR (default): {e}")
+                results['default'] = f"Error: {e}"
 
             return results
 
         except Exception as e:
-            print(f"WoW HP/Mana extraction error: {e}")
-            return {'hp_text': [], 'mana_text': []}
+            logging.error(f"test_manual_ocr_region: Ogólny błąd: {e}")
+            return {'error': str(e)}
 
-    def _calculate_wow_text_confidence(self, text: str) -> float:
-        """Oblicz pewność rozpoznania tekstu WoW"""
-        # Sprawdź czy tekst ma typowy format WoW
-        confidence = 0.5
+    def _preprocess_for_wow_numbers_safe(self, image: np.ndarray) -> np.ndarray:
+        """Bezpieczny preprocessing z pełną walidacją i obsługą kolorowych teł"""
+        try:
+            # Sprawdź czy obraz nie jest pusty
+            if image is None:
+                logging.error("_preprocess_for_wow_numbers_safe: Input image is None")
+                return np.zeros((50, 50), dtype=np.uint8)
 
-        if '/' in text:  # Format "1000/1000"
-            confidence += 0.3
+            if image.size == 0:
+                logging.error("_preprocess_for_wow_numbers_safe: Input image is empty")
+                return np.zeros((50, 50), dtype=np.uint8)
 
-        if '%' in text:  # Format "100%"
-            confidence += 0.2
+            # Sprawdź minimalny rozmiar
+            if len(image.shape) < 2:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Invalid image shape: {image.shape}")
+                return np.zeros((50, 50), dtype=np.uint8)
 
-        # Sprawdź czy wszystkie znaki to cyfry, /, %
-        valid_chars = set('0123456789/%')
-        if all(c in valid_chars for c in text):
-            confidence += 0.2
+            if image.shape[0] < 1 or image.shape[1] < 1:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Image too small: {image.shape}")
+                return np.zeros((50, 50), dtype=np.uint8)
 
-        return min(confidence, 1.0)
+            # === ULEPSZONA KONWERSJA DO SKALI SZAROŚCI ===
+            try:
+                if len(image.shape) == 3:
+                    if image.shape[2] == 0:
+                        logging.error("_preprocess_for_wow_numbers_safe: Image has 0 channels")
+                        return np.zeros((50, 50), dtype=np.uint8)
+
+                    # Spróbuj różne metody konwersji dla różnych teł
+                    # Metoda 1: Standardowa BGR->GRAY
+                    gray_standard = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+                    # Metoda 2: Używaj kanału z najwyższym kontrastem
+                    b, g, r = cv2.split(image)
+
+                    # Sprawdź który kanał ma najwyższy kontrast (dla białego tekstu)
+                    contrast_b = np.std(b)
+                    contrast_g = np.std(g)
+                    contrast_r = np.std(r)
+
+                    logging.info(f"Kontrast kanałów - B: {contrast_b:.2f}, G: {contrast_g:.2f}, R: {contrast_r:.2f}")
+
+                    # Wybierz kanał z najwyższym kontrastem
+                    if contrast_r >= contrast_g and contrast_r >= contrast_b:
+                        gray = r
+                        logging.info("Używam kanału czerwonego")
+                    elif contrast_g >= contrast_b:
+                        gray = g
+                        logging.info("Używam kanału zielonego")
+                    else:
+                        gray = b
+                        logging.info("Używam kanału niebieskiego")
+
+                    # Porównaj z standardową konwersją i wybierz lepszą
+                    if np.std(gray_standard) > np.std(gray):
+                        gray = gray_standard
+                        logging.info("Używam standardowej konwersji BGR->GRAY")
+
+                else:
+                    gray = image.copy()
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Color conversion failed: {e}")
+                return np.zeros((50, 50), dtype=np.uint8)
+
+            if gray is None or gray.size == 0:
+                logging.error("_preprocess_for_wow_numbers_safe: Gray conversion resulted in empty image")
+                return np.zeros((50, 50), dtype=np.uint8)
+
+            # 2. Zwiększ rozmiar z walidacją
+            try:
+                scale = 6
+                height, width = gray.shape
+                new_width = max(width * scale, 30)  # Minimum 30px
+                new_height = max(height * scale, 10)  # Minimum 10px
+
+                enlarged = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Resize failed: {e}")
+                enlarged = gray
+
+            if enlarged is None or enlarged.size == 0:
+                logging.error("_preprocess_for_wow_numbers_safe: Resize resulted in empty image")
+                return gray
+
+            # 3. Normalizacja z walidacją
+            try:
+                normalized = cv2.normalize(enlarged, None, 0, 255, cv2.NORM_MINMAX)
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Normalization failed: {e}")
+                normalized = enlarged
+
+            # 4. Dynamiczny kontrast na podstawie histogramu
+            try:
+                # Sprawdź czy obraz jest ciemny czy jasny
+                mean_intensity = np.mean(normalized)
+                logging.info(f"Średnia intensywność: {mean_intensity:.2f}")
+
+                if mean_intensity < 128:  # Ciemny obraz (tekst jasny na ciemnym tle)
+                    alpha = 2.5  # Większy kontrast dla ciemnych obrazów
+                    beta = 60
+                else:  # Jasny obraz
+                    alpha = 1.5
+                    beta = 20
+
+                contrast = cv2.convertScaleAbs(normalized, alpha=alpha, beta=beta)
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Contrast adjustment failed: {e}")
+                contrast = normalized
+
+            # 5. Rozmycie z walidacją
+            try:
+                blurred = cv2.GaussianBlur(contrast, (3, 3), 0)
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Blur failed: {e}")
+                blurred = contrast
+
+            # 6. Adaptacyjny threshold zamiast stałego
+            try:
+                # Spróbuj kilka metod threshold
+                _, thresh1 = cv2.threshold(blurred, 180, 255, cv2.THRESH_BINARY)
+                _, thresh2 = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                thresh3 = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+
+                # Wybierz threshold z najlepszym kontrastem
+                std1 = np.std(thresh1)
+                std2 = np.std(thresh2)
+                std3 = np.std(thresh3)
+
+                logging.info(f"Threshold std - Fixed: {std1:.2f}, OTSU: {std2:.2f}, Adaptive: {std3:.2f}")
+
+                if std2 >= std1 and std2 >= std3:
+                    thresh = thresh2
+                    logging.info("Używam OTSU threshold")
+                elif std3 >= std1:
+                    thresh = thresh3
+                    logging.info("Używam Adaptive threshold")
+                else:
+                    thresh = thresh1
+                    logging.info("Używam Fixed threshold")
+
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Threshold failed: {e}")
+                thresh = blurred
+
+            # 7. Morfologia z walidacją
+            try:
+                kernel = np.ones((2, 2), np.uint8)
+                cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Morphology failed: {e}")
+                cleaned = thresh
+
+            # 8. Border z walidacją
+            try:
+                bordered = cv2.copyMakeBorder(cleaned, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=0)
+            except Exception as e:
+                logging.error(f"_preprocess_for_wow_numbers_safe: Border failed: {e}")
+                bordered = cleaned
+
+            return bordered
+
+        except Exception as e:
+            logging.error(f"_preprocess_for_wow_numbers_safe: Critical error: {e}")
+            return np.zeros((50, 50), dtype=np.uint8)
+
+    # === NOWE FUNKCJE KTÓRE UŻYWAJĄ test_manual_ocr_region ===
+
+    def get_hp_mana_values_like_test(self, image: np.ndarray) -> Dict[str, Any]:
+        """Pobierz HP/Mana DOKŁADNIE tak samo jak test_manual_ocr_region - ULEPSZONE"""
+        if not self.ocr_available:
+            return {'hp': None, 'mana': None, 'error': 'OCR niedostępny'}
+
+        # Użyj DOKŁADNIE tych samych regionów co w test
+        hp_region = self.config['ocr_regions']['hp_region']  # [270, 125, 50, 29]
+        mana_region = self.config['ocr_regions']['mana_region']  # [270, 147, 50, 29]
+
+        results = {'hp': None, 'mana': None, 'debug': {}}
+
+        # === PRZETWARZAJ ZAWSZE OBA REGIONY NIEZALEŻNIE ===
+
+        # HP - z pełną izolacją błędów
+        logging.info("=== ROZPOCZYNAM PRZETWARZANIE HP ===")
+        try:
+            x, y, w, h = hp_region
+            logging.info(f"HP region: ({x},{y},{w},{h})")
+
+            hp_ocr_result = self.test_manual_ocr_region(image.copy(), x, y, w, h)  # .copy() dla bezpieczeństwa
+            logging.info(f"HP OCR result: {hp_ocr_result}")
+
+            if 'error' not in hp_ocr_result:
+                # Spróbuj wyciągnąć wartość z tekstu
+                for key, text in hp_ocr_result.items():
+                    if text and isinstance(text, str) and not text.startswith('Error:'):
+                        hp_value = self._parse_percentage_or_number(text)
+                        if hp_value is not None:
+                            results['hp'] = hp_value
+                            results['debug']['hp_source'] = f"{key}: {text}"
+                            logging.info(f"HP wartość znaleziona: {hp_value} z '{text}'")
+                            break
+
+                if results['hp'] is None:
+                    logging.warning("HP: Nie udało się sparsować żadnej wartości")
+                    results['debug']['hp_error'] = 'Nie udało się sparsować'
+            else:
+                logging.error(f"HP: OCR error - {hp_ocr_result.get('error', 'Unknown')}")
+                results['debug']['hp_error'] = hp_ocr_result.get('error', 'OCR failed')
+
+        except Exception as e:
+            logging.error(f"HP: Exception podczas przetwarzania - {e}")
+            results['debug']['hp_error'] = f'Exception: {e}'
+
+        # === PRZERWA MIĘDZY REGIONAMI ===
+        import time
+        time.sleep(0.1)  # Mała przerwa żeby nie było konfliktów
+
+        # MANA - z pełną izolacją błędów
+        logging.info("=== ROZPOCZYNAM PRZETWARZANIE MANA ===")
+        try:
+            x, y, w, h = mana_region
+            logging.info(f"Mana region: ({x},{y},{w},{h})")
+
+            mana_ocr_result = self.test_manual_ocr_region(image.copy(), x, y, w, h)  # .copy() dla bezpieczeństwa
+            logging.info(f"Mana OCR result: {mana_ocr_result}")
+
+            if 'error' not in mana_ocr_result:
+                # Spróbuj wyciągnąć wartość z tekstu
+                for key, text in mana_ocr_result.items():
+                    if text and isinstance(text, str) and not text.startswith('Error:'):
+                        mana_value = self._parse_percentage_or_number(text)
+                        if mana_value is not None:
+                            results['mana'] = mana_value
+                            results['debug']['mana_source'] = f"{key}: {text}"
+                            logging.info(f"Mana wartość znaleziona: {mana_value} z '{text}'")
+                            break
+
+                if results['mana'] is None:
+                    logging.warning("Mana: Nie udało się sparsować żadnej wartości")
+                    results['debug']['mana_error'] = 'Nie udało się sparsować'
+            else:
+                logging.error(f"Mana: OCR error - {mana_ocr_result.get('error', 'Unknown')}")
+                results['debug']['mana_error'] = mana_ocr_result.get('error', 'OCR failed')
+
+        except Exception as e:
+            logging.error(f"Mana: Exception podczas przetwarzania - {e}")
+            results['debug']['mana_error'] = f'Exception: {e}'
+
+        # === PODSUMOWANIE ===
+        logging.info(f"=== WYNIKI KOŃCOWE: HP={results['hp']}, Mana={results['mana']} ===")
+
+        return results
+
+    def _parse_percentage_or_number(self, text: str) -> Optional[float]:
+        """Parsuj tekst do wartości procentowej lub liczbowej"""
+        if not text:
+            return None
+
+        try:
+            # Usuń białe znaki
+            text = text.strip()
+
+            # Format "100%"
+            if '%' in text:
+                number_part = text.replace('%', '').strip()
+                if number_part.isdigit():
+                    return float(number_part)
+
+            # Format "1000/1000" -> oblicz procent
+            if '/' in text:
+                parts = text.split('/')
+                if len(parts) == 2:
+                    try:
+                        current = float(parts[0].strip())
+                        maximum = float(parts[1].strip())
+                        if maximum > 0:
+                            return (current / maximum) * 100
+                    except:
+                        pass
+
+            # Pojedyncza liczba
+            if text.isdigit():
+                return float(text)
+
+            return None
+
+        except Exception as e:
+            logging.error(f"Błąd parsowania '{text}': {e}")
+            return None
+
+    # ALIASY dla kompatybilności wstecznej
+    def extract_hp_mana_values(self, image: np.ndarray) -> Dict[str, Any]:
+        """Alias dla get_hp_mana_values_like_test - używa dokładnie tej samej metody co test"""
+        return self.get_hp_mana_values_like_test(image)
+
+    def get_hp_percentage(self, image: np.ndarray) -> Optional[float]:
+        """Pobierz tylko HP jako procent"""
+        result = self.get_hp_mana_values_like_test(image)
+        return result.get('hp')
+
+    def get_mana_percentage(self, image: np.ndarray) -> Optional[float]:
+        """Pobierz tylko Mana jako procent"""
+        result = self.get_hp_mana_values_like_test(image)
+        return result.get('mana')
+
+    def debug_compare_methods(self, image: np.ndarray):
+        """Porównaj wyniki test_manual_ocr_region vs extract_hp_mana_values"""
+        print("=== PORÓWNANIE METOD ===")
+
+        hp_region = self.config['ocr_regions']['hp_region']
+        mana_region = self.config['ocr_regions']['mana_region']
+
+        print(f"Obraz: {image.shape if image is not None else 'None'}")
+        print(f"HP region: {hp_region}")
+        print(f"Mana region: {mana_region}")
+
+        # Test metoda
+        print("\n--- TEST METHOD ---")
+        x, y, w, h = hp_region
+        hp_test = self.test_manual_ocr_region(image, x, y, w, h)
+        print(f"HP test: {hp_test}")
+
+        x, y, w, h = mana_region
+        mana_test = self.test_manual_ocr_region(image, x, y, w, h)
+        print(f"Mana test: {mana_test}")
+
+        # Nowa metoda
+        print("\n--- NEW METHOD ---")
+        new_result = self.get_hp_mana_values_like_test(image)
+        print(f"New result: {new_result}")
+
+    # === RESZTA STARYCH FUNKCJI ===
+
+    def _extract_numbers_from_text(self, text: str) -> List[int]:
+        """Wyciągnij liczby z tekstu OCR"""
+        try:
+            # Usuń wszystkie znaki oprócz cyfr i /
+            cleaned = ''.join(c for c in text if c.isdigit() or c == '/')
+
+            if '/' in cleaned:
+                # Format "1000/1000"
+                parts = cleaned.split('/')
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    current, max_val = map(int, parts)
+                    return [current, max_val]
+            else:
+                # Pojedyncza liczba
+                return [int(cleaned)] if cleaned else []
+        except Exception as e:
+            logging.error(f"Błąd podczas wyciągania liczb z tekstu '{text}': {e}")
+            return []
+
+    def extract_wow_hp_mana_text(self, image: np.ndarray) -> Dict[str, Any]:
+        """Stara funkcja - używa już nowej metody"""
+        return self.get_hp_mana_values_like_test(image)
 
     def detect_wow_ui_numbers(self, image: np.ndarray) -> Dict[str, Any]:
         """Kompletna detekcja liczb w WoW UI"""
@@ -156,25 +624,27 @@ class VisionEngine:
             'debug_regions': []
         }
 
-        # Dodaj ogólne regiony gdzie mogą być liczby
-        general_regions = [
-            (50, 50, 200, 50),  # Górny lewy - status gracza
-            (1000, 50, 200, 50),  # Górny prawy - minimap/czas
-            (50, 600, 800, 100),  # Dolny obszar - chat/UI
-        ]
+        # Dodaj debug regiony z ustawień
+        hp_region = self.config['ocr_regions']['hp_region']
+        mana_region = self.config['ocr_regions']['mana_region']
 
-        for i, (x, y, w, h) in enumerate(general_regions):
-            # Sprawdź czy region mieści się w obrazie
-            if x + w <= image.shape[1] and y + h <= image.shape[0]:
-                results['debug_regions'].append({
-                    'id': i,
-                    'x': x, 'y': y, 'width': w, 'height': h,
-                    'purpose': f'debug_region_{i}'
-                })
+        results['debug_regions'] = [
+            {
+                'id': 0,
+                'x': hp_region[0], 'y': hp_region[1],
+                'width': hp_region[2], 'height': hp_region[3],
+                'purpose': 'hp_region'
+            },
+            {
+                'id': 1,
+                'x': mana_region[0], 'y': mana_region[1],
+                'width': mana_region[2], 'height': mana_region[3],
+                'purpose': 'mana_region'
+            }
+        ]
 
         return results
 
-    # Aktualizuj analyze_image aby używał nowych metod
     def analyze_image(self, image: np.ndarray) -> Dict[str, Any]:
         """Kompletna analiza obrazu - ZAKTUALIZOWANA dla WoW"""
         results = {
@@ -183,558 +653,6 @@ class VisionEngine:
             'text': self.extract_text_regions(image) if self.ocr_available else [],
             'ui_elements': self.detect_ui_elements(image),
             'wow_numbers': self.detect_wow_ui_numbers(image) if self.ocr_available else {}
-        }
-
-        return results
-
-    # DODAJ te metody do klasy VisionEngine w src/vision/vision_engine.py:
-
-    def detect_custom_color_in_region(self, image: np.ndarray, target_color: Dict[str, Any],
-                                      region: Tuple[int, int, int, int], tolerance: int = 15) -> Dict[str, Any]:
-        """Wykryj niestandardowy kolor w określonym regionie"""
-        try:
-            rx, ry, rw, rh = region
-
-            # Sprawdź czy region mieści się w obrazie
-            img_height, img_width = image.shape[:2]
-            if rx + rw > img_width or ry + rh > img_height or rx < 0 or ry < 0:
-                return {'detected_areas': [], 'error': 'Region poza obrazem'}
-
-            # Wytnij region
-            roi = image[ry:ry + rh, rx:rx + rw]
-
-            # Konwertuj na HSV dla lepszego dopasowania kolorów
-            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-            # Utwórz maskę koloru z tolerancją
-            target_hsv = target_color['hsv']
-
-            # Oblicz zakresy HSV z tolerancją
-            lower_hsv, upper_hsv = self._calculate_hsv_range(target_hsv, tolerance)
-
-            # Stwórz maskę
-            mask = cv2.inRange(hsv_roi, lower_hsv, upper_hsv)
-
-            # Znajdź kontury obszarów z tym kolorem
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            detected_areas = []
-
-            for contour in contours:
-                area = cv2.contourArea(contour)
-
-                # Filtruj bardzo małe obszary
-                if area < 10:
-                    continue
-
-                # Prostokąt otaczający
-                x, y, w, h = cv2.boundingRect(contour)
-
-                # Przelicz współrzędne na cały obraz (dodaj offset regionu)
-                global_x = rx + x
-                global_y = ry + y
-
-                # Oblicz pokrycie (% pikseli w prostokącie który ma ten kolor)
-                rect_area = w * h
-                coverage = (area / rect_area * 100) if rect_area > 0 else 0
-
-                area_info = {
-                    'x': global_x,
-                    'y': global_y,
-                    'width': w,
-                    'height': h,
-                    'area': int(area),
-                    'coverage': coverage,
-                    'center_x': global_x + w // 2,
-                    'center_y': global_y + h // 2
-                }
-
-                detected_areas.append(area_info)
-
-            # Sortuj według rozmiaru (największe pierwsze)
-            detected_areas.sort(key=lambda x: x['area'], reverse=True)
-
-            return {
-                'detected_areas': detected_areas,
-                'total_detected_pixels': int(np.sum(mask > 0)),
-                'region_coverage': (np.sum(mask > 0) / (rw * rh) * 100) if (rw * rh) > 0 else 0,
-                'mask_debug': mask  # Do debugowania
-            }
-
-        except Exception as e:
-            return {'detected_areas': [], 'error': f'Color detection error: {e}'}
-
-    def _calculate_hsv_range(self, target_hsv: Tuple[int, int, int], tolerance: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Oblicz zakres HSV z tolerancją"""
-        h, s, v = target_hsv
-
-        # Hue (odcień) - specjalne traktowanie bo to koło (0-179 w OpenCV)
-        h_tolerance = min(tolerance, 30)  # Max 30 dla Hue
-        if h - h_tolerance < 0:
-            # Wrap around (np. czerwony może być 170-179 lub 0-10)
-            lower_h = 0
-            upper_h = h + h_tolerance
-        elif h + h_tolerance > 179:
-            lower_h = h - h_tolerance
-            upper_h = 179
-        else:
-            lower_h = h - h_tolerance
-            upper_h = h + h_tolerance
-
-        # Saturation i Value - normalne zakresy z ograniczeniami
-        s_tolerance = min(tolerance * 2, 50)  # Większa tolerancja dla saturacji
-        v_tolerance = min(tolerance * 2, 50)
-
-        lower_s = max(0, s - s_tolerance)
-        upper_s = min(255, s + s_tolerance)
-
-        lower_v = max(0, v - v_tolerance)
-        upper_v = min(255, v + v_tolerance)
-
-        lower_hsv = np.array([lower_h, lower_s, lower_v])
-        upper_hsv = np.array([upper_h, upper_s, upper_v])
-
-        return lower_hsv, upper_hsv
-
-    def detect_multiple_custom_colors(self, image: np.ndarray, color_definitions: Dict[str, Dict]) -> Dict[str, Any]:
-        """Wykryj wiele niestandardowych kolorów jednocześnie"""
-        results = {}
-
-        for name, definition in color_definitions.items():
-            try:
-                color_result = self.detect_custom_color_in_region(
-                    image,
-                    definition['color'],
-                    definition['region'],
-                    definition['tolerance']
-                )
-                results[name] = color_result
-            except Exception as e:
-                results[name] = {'detected_areas': [], 'error': f'Error: {e}'}
-
-        return results
-
-    def create_color_analysis_report(self, image: np.ndarray, color_definitions: Dict[str, Dict]) -> str:
-        """Stwórz raport analizy kolorów"""
-        results = self.detect_multiple_custom_colors(image, color_definitions)
-
-        report = "=== RAPORT ANALIZY KOLORÓW ===\n\n"
-
-        for name, result in results.items():
-            report += f"{name.upper()}:\n"
-
-            if 'error' in result:
-                report += f"  ❌ Błąd: {result['error']}\n"
-            else:
-                areas = result['detected_areas']
-                coverage = result.get('region_coverage', 0)
-
-                report += f"  📊 Znaleziono: {len(areas)} obszarów\n"
-                report += f"  📈 Pokrycie regionu: {coverage:.1f}%\n"
-
-                if areas:
-                    largest = areas[0]  # Pierwszy = największy
-                    report += f"  🎯 Największy obszar: ({largest['center_x']}, {largest['center_y']})\n"
-                    report += f"     Rozmiar: {largest['width']}x{largest['height']}px\n"
-                    report += f"     Pokrycie: {largest['coverage']:.1f}%\n"
-                else:
-                    report += f"  ⚠️ Nie wykryto koloru\n"
-
-            report += "\n"
-
-        return report
-
-    def get_dominant_colors_in_region(self, image: np.ndarray, region: Tuple[int, int, int, int],
-                                      k: int = 5) -> List[Dict[str, Any]]:
-        """Znajdź dominujące kolory w regionie (pomocnicze do wybierania kolorów)"""
-        try:
-            rx, ry, rw, rh = region
-            roi = image[ry:ry + rh, rx:rx + rw]
-
-            # Konwertuj na RGB dla k-means
-            rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-
-            # Reshape do listy pikseli
-            pixels = rgb_roi.reshape(-1, 3).astype(np.float32)
-
-            # K-means clustering
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-            _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-
-            # Policz częstość każdego koloru
-            unique, counts = np.unique(labels, return_counts=True)
-
-            colors = []
-            for i, (color_idx, count) in enumerate(zip(unique, counts)):
-                rgb = centers[color_idx].astype(int)
-                bgr = (int(rgb[2]), int(rgb[1]), int(rgb[0]))  # Konwersja RGB->BGR
-
-                # Konwertuj na HSV
-                hsv_pixel = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-                hsv = (int(hsv_pixel[0]), int(hsv_pixel[1]), int(hsv_pixel[2]))
-
-                percentage = (count / len(pixels)) * 100
-
-                colors.append({
-                    'rgb': tuple(rgb),
-                    'bgr': bgr,
-                    'hsv': hsv,
-                    'percentage': percentage,
-                    'pixel_count': int(count)
-                })
-
-            # Sortuj według częstości
-            colors.sort(key=lambda x: x['percentage'], reverse=True)
-
-            return colors
-
-        except Exception as e:
-            print(f"Błąd analizy dominujących kolorów: {e}")
-            return []
-
-    # Aktualizuj visualize_results aby pokazywał WoW numbers
-    def visualize_results(self, image: np.ndarray, results: Dict[str, Any]) -> np.ndarray:
-        """Narysuj wyniki analizy na obrazie - ZAKTUALIZOWANE dla WoW"""
-        vis_image = image.copy()
-
-        try:
-            # Rysuj dopasowane wzorce (jak wcześniej)
-            if 'templates' in results:
-                for template_name, matches in results['templates'].items():
-                    for match in matches:
-                        cv2.rectangle(vis_image,
-                                      (match['x'], match['y']),
-                                      (match['x'] + match['width'], match['y'] + match['height']),
-                                      (0, 255, 0), 2)
-                        label = f"{template_name.split('/')[-1]}: {match['confidence']:.2f}"
-                        cv2.putText(vis_image, label,
-                                    (match['x'], match['y'] - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-            # Rysuj paski HP/Mana (jak wcześniej)
-            if 'colors' in results:
-                for bar in results['colors'].get('health_bars', []):
-                    cv2.rectangle(vis_image,
-                                  (bar['x'], bar['y']),
-                                  (bar['x'] + bar['width'], bar['y'] + bar['height']),
-                                  (0, 0, 255), 2)
-                    cv2.putText(vis_image, "HP",
-                                (bar['x'], bar['y'] - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-
-                for bar in results['colors'].get('mana_bars', []):
-                    cv2.rectangle(vis_image,
-                                  (bar['x'], bar['y']),
-                                  (bar['x'] + bar['width'], bar['y'] + bar['height']),
-                                  (255, 0, 0), 2)
-                    cv2.putText(vis_image, "MANA",
-                                (bar['x'], bar['y'] - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-
-            # NOWE: Rysuj wykryte liczby WoW
-            if 'wow_numbers' in results:
-                wow_data = results['wow_numbers']
-
-                # HP numbers - zielone
-                for hp_info in wow_data.get('hp_mana_numbers', {}).get('hp_text', []):
-                    cv2.rectangle(vis_image,
-                                  (hp_info['x'], hp_info['y']),
-                                  (hp_info['x'] + hp_info['width'], hp_info['y'] + hp_info['height']),
-                                  (0, 255, 0), 2)
-                    cv2.putText(vis_image, f"HP: {hp_info['text']}",
-                                (hp_info['x'], hp_info['y'] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                # Mana numbers - niebieskie
-                for mana_info in wow_data.get('hp_mana_numbers', {}).get('mana_text', []):
-                    cv2.rectangle(vis_image,
-                                  (mana_info['x'], mana_info['y']),
-                                  (mana_info['x'] + mana_info['width'], mana_info['y'] + mana_info['height']),
-                                  (255, 0, 0), 2)
-                    cv2.putText(vis_image, f"MANA: {mana_info['text']}",
-                                (mana_info['x'], mana_info['y'] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-                # Debug regions - żółte
-                for region in wow_data.get('debug_regions', []):
-                    cv2.rectangle(vis_image,
-                                  (region['x'], region['y']),
-                                  (region['x'] + region['width'], region['y'] + region['height']),
-                                  (0, 255, 255), 1)
-
-            # Rysuj wykryty tekst (jak wcześniej)
-            if 'text' in results:
-                for text_info in results['text']:
-                    cv2.rectangle(vis_image,
-                                  (text_info['x'], text_info['y']),
-                                  (text_info['x'] + text_info['width'], text_info['y'] + text_info['height']),
-                                  (255, 255, 0), 1)
-
-            return vis_image
-
-        except Exception as e:
-            print(f"Błąd podczas wizualizacji: {e}")
-            return vis_image
-    def extract_numbers_from_regions(self, image: np.ndarray, regions: List[Tuple[int, int, int, int]]) -> List[
-        Dict[str, Any]]:
-        """Wyciągnij tylko liczby z określonych regionów"""
-        if not self.ocr_available:
-            return []
-
-        try:
-            import pytesseract
-
-            results = []
-            number_config = '--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789%/'
-
-            for i, (x, y, w, h) in enumerate(regions):
-                roi = image[y:y + h, x:x + w]
-
-                # Agresywny preprocessing dla liczb
-                processed = self._preprocess_for_numbers(roi)
-
-                try:
-                    text = pytesseract.image_to_string(processed, config=number_config).strip()
-
-                    if text and any(c.isdigit() for c in text):  # Tylko jeśli są cyfry
-                        results.append({
-                            'region_id': i,
-                            'text': text,
-                            'x': x, 'y': y, 'width': w, 'height': h,
-                            'type': 'number'
-                        })
-                except Exception as e:
-                    print(f"OCR error region {i}: {e}")
-
-            return results
-        except Exception as e:
-            print(f"Number extraction error: {e}")
-            return []
-
-    def _preprocess_for_numbers(self, image: np.ndarray) -> np.ndarray:
-        """Agresywny preprocessing dla liczb WoW"""
-        # Konwertuj do skali szarości
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-
-        # Zwiększ rozmiar dla lepszego OCR
-        scale_factor = 3
-        height, width = gray.shape
-        resized = cv2.resize(gray, (width * scale_factor, height * scale_factor), interpolation=cv2.INTER_CUBIC)
-
-        # Bardzo wysoki kontrast dla liczb
-        contrast = cv2.convertScaleAbs(resized, alpha=3.0, beta=50)
-
-        # Rozmycie + sharpening
-        blurred = cv2.GaussianBlur(contrast, (3, 3), 0)
-        sharpened = cv2.addWeighted(contrast, 1.5, blurred, -0.5, 0)
-
-        # Progowanie adaptacyjne
-        thresh = cv2.adaptiveThreshold(sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-
-        return thresh
-
-    # DODAJ tę metodę do klasy VisionEngine w src/vision/vision_engine.py:
-
-    def test_manual_ocr_region(self, roi: np.ndarray, x: int, y: int, w: int, h: int) -> Dict[str, str]:
-        """Test różnych konfiguracji OCR na ręcznie wybranym regionie"""
-        if not self.ocr_available:
-            return {"error": "OCR niedostępny"}
-
-        try:
-            import pytesseract
-
-            results = {}
-
-            # Test różnych konfiguracji OCR
-            configs = {
-                "tylko_cyfry": "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789",
-                "cyfry_plus": "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789/%",
-                "standardowy": "--oem 3 --psm 6",
-                "pojedyncze_słowo": "--oem 3 --psm 8",
-                "pojedyncza_linia": "--oem 3 --psm 7"
-            }
-
-            # Test różnych preprocessingów
-            preprocessings = {
-                "surowy": roi,
-                "wow_numbers": self._preprocess_for_wow_numbers(roi),
-                "standardowy": self._preprocess_for_ocr(roi)
-            }
-
-            # Test kombinacji preprocessing + config
-            for prep_name, processed_image in preprocessings.items():
-                for config_name, config in configs.items():
-                    try:
-                        text = pytesseract.image_to_string(processed_image, config=config).strip()
-                        key = f"{prep_name}_{config_name}"
-                        results[key] = text if text else "(pusty)"
-
-                    except Exception as e:
-                        results[f"{prep_name}_{config_name}"] = f"(błąd: {str(e)[:20]})"
-
-            # Dodatkowy test z bardzo dużym skalowaniem
-            try:
-                # 8x skalowanie dla bardzo małych liczb
-                height, width = roi.shape[:2] if len(roi.shape) == 2 else roi.shape[:2]
-                huge_scale = cv2.resize(roi, (width * 8, height * 8), interpolation=cv2.INTER_CUBIC)
-                huge_processed = self._preprocess_for_wow_numbers(huge_scale)
-
-                text = pytesseract.image_to_string(huge_processed, config=configs["cyfry_plus"]).strip()
-                results["mega_scale_cyfry"] = text if text else "(pusty)"
-
-            except Exception as e:
-                results["mega_scale_cyfry"] = f"(błąd: {str(e)[:20]})"
-
-            # Zapisz obrazy debug (opcjonalnie)
-            try:
-                import os
-                debug_dir = "data/screenshots/debug_ocr"
-                os.makedirs(debug_dir, exist_ok=True)
-
-                timestamp = datetime.now().strftime('%H%M%S')
-
-                # Zapisz oryginalny re# Manual Color Detection
-                # color_frame = ttk.LabelFrame(vision_frame, text="Ręczny wybór kolorów", padding="5")
-                # color_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
-                #
-                # # Color picker coordinates
-                # ttk.Label(color_frame, text="Kliknij punkt aby pobrać kolor (x, y):").grid(row=0, column=0, sticky=tk.W)
-                #
-                # color_coords_frame = ttk.Frame(color_frame)
-                # color_coords_frame.grid(row=1, column=0, sticky=tk.W)
-                #
-                # self.color_pick_x_var = tk.StringVar(value="150")
-                # self.color_pick_y_var = tk.StringVar(value="70")
-                #
-                # ttk.Entry(color_coords_frame, textvariable=self.color_pick_x_var, width=8).grid(row=0, column=0)
-                # ttk.Label(color_coords_frame, text=",").grid(row=0, column=1, padx=2)
-                # ttk.Entry(color_coords_frame, textvariable=self.color_pick_y_var, width=8).grid(row=0, column=2)
-                #
-                # ttk.Button(color_coords_frame, text="Pobierz Kolor",
-                #           command=self.pick_color_from_point).grid(row=0, column=3, padx=(5, 0))
-                #
-                # # Color tolerance
-                # ttk.Label(color_frame, text="Tolerancja koloru (0-50):").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
-                # self.color_tolerance_var = tk.StringVar(value="15")
-                # ttk.Entry(color_frame, textvariable=self.color_tolerance_var, width=8).grid(row=3, column=0, sticky=tk.W)
-                #
-                # # Current color display
-                # self.current_color_var = tk.StringVar(value="RGB: nie wybrano")
-                # ttk.Label(color_frame, textvariable=self.current_color_var, foreground="blue").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
-                #
-                # self.current_hsv_var = tk.StringVar(value="HSV: nie wybrano")
-                # ttk.Label(color_frame, textvariable=self.current_hsv_var, foreground="green").grid(row=5, column=0, sticky=tk.W)
-                #
-                # # Color region definition
-                # ttk.Label(color_frame, text="Region do skanowania (x, y, w, h):").grid(row=6, column=0, sticky=tk.W, pady=(10, 0))
-                #
-                # color_region_frame = ttk.Frame(color_frame)
-                # color_region_frame.grid(row=7, column=0, sticky=tk.W)
-                #
-                # self.color_region_x_var = tk.StringVar(value="100")
-                # self.color_region_y_var = tk.StringVar(value="60")
-                # self.color_region_w_var = tk.StringVar(value="200")
-                # self.color_region_h_var = tk.StringVar(value="50")
-                #
-                # ttk.Entry(color_region_frame, textvariable=self.color_region_x_var, width=6).grid(row=0, column=0)
-                # ttk.Label(color_region_frame, text=",").grid(row=0, column=1, padx=2)
-                # ttk.Entry(color_region_frame, textvariable=self.color_region_y_var, width=6).grid(row=0, column=2)
-                # ttk.Label(color_region_frame, text=",").grid(row=0, column=3, padx=2)
-                # ttk.Entry(color_region_frame, textvariable=self.color_region_w_var, width=6).grid(row=0, column=4)
-                # ttk.Label(color_region_frame, text=",").grid(row=0, column=5, padx=2)
-                # ttk.Entry(color_region_frame, textvariable=self.color_region_h_var, width=6).grid(row=0, column=6)
-                #
-                # # Color test buttons
-                # color_buttons_frame = ttk.Frame(color_frame)
-                # color_buttons_frame.grid(row=8, column=0, sticky=tk.W, pady=(10, 0))
-                #
-                # ttk.Button(color_buttons_frame, text="Test Kolor w Regionie",
-                #           command=self.test_color_in_region).grid(row=0, column=0)
-                #
-                # ttk.Button(color_buttons_frame, text="Zapisz jako HP",
-                #           command=self.save_hp_color).grid(row=0, column=1, padx=(5, 0))
-                #
-                # ttk.Button(color_buttons_frame, text="Zapisz jako Mana",
-                #           command=self.save_mana_color).grid(row=0, column=2, padx=(5, 0))
-                #
-                # ttk.Button(color_buttons_frame, text="Zapisz Niestandardowy",
-                #           command=self.save_custom_color).grid(row=0, column=3, padx=(5, 0))
-                #
-                # # Saved colors display
-                # ttk.Label(color_frame, text="Zapisane kolory:").grid(row=9, column=0, sticky=tk.W, pady=(10, 0))
-                # self.saved_colors_var = tk.StringVar(value="HP: brak, Mana: brak")
-                # ttk.Label(color_frame, textvariable=self.saved_colors_var, foreground="purple").grid(row=10, column=0, sticky=tk.W)
-                #
-                # # Test all saved
-                # ttk.Button(color_frame, text="Test Wszystkich Zapisanych Kolorów",
-                #           command=self.test_all_saved_colors).grid(row=11, column=0, pady=(10, 0), sticky=tk.W)gion
-                cv2.imwrite(f"{debug_dir}/region_original_{timestamp}.png", roi)
-
-                # Zapisz przetworzone wersje
-                cv2.imwrite(f"{debug_dir}/region_wow_processed_{timestamp}.png",
-                            self._preprocess_for_wow_numbers(roi))
-
-            except Exception as e:
-                results["debug_save"] = f"Debug save error: {e}"
-
-            return results
-
-        except Exception as e:
-            return {"error": f"OCR test failed: {e}"}
-    def detect_hp_mana_numbers(self, image: np.ndarray) -> Dict[str, Any]:
-        """Wykryj liczby HP/Mana z obrazu"""
-        # Znajdź paski HP/Mana
-        color_results = self.detect_health_mana_bars(image)
-
-        numbers = {}
-
-        # Dla każdego paska, sprawdź region z liczbami (zwykle po prawej)
-        for bar_type in ['health_bars', 'mana_bars']:
-            numbers[bar_type] = []
-
-            for bar in color_results[bar_type]:
-                # Region z liczbami zwykle 20px w prawo od paska
-                text_x = bar['x'] + bar['width'] + 5
-                text_y = bar['y'] - 2
-                text_w = 60  # Szerokość dla tekstu "1000/1000"
-                text_h = bar['height'] + 4
-
-                # Sprawdź czy region mieści się w obrazie
-                if text_x + text_w < image.shape[1] and text_y + text_h < image.shape[0]:
-                    number_regions = [(text_x, text_y, text_w, text_h)]
-                    detected_numbers = self.extract_numbers_from_regions(image, number_regions)
-
-                    if detected_numbers:
-                        numbers[bar_type].extend(detected_numbers)
-
-        return numbers
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.template_matcher = TemplateMatcher(config['paths']['templates'])
-
-        # Sprawdź czy OCR jest dostępny
-        self.ocr_available = False
-        try:
-            import pytesseract
-            self.ocr_config = '--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789%'  # Tylko cyfry i %
-            self.ocr_config_text = '--oem 3 --psm 6'  # Pełny tekst
-            self.ocr_available = True
-            print("✓ OCR (Tesseract) dostępny")
-        except ImportError:
-            print("⚠ OCR niedostępny - zainstaluj: pip install pytesseract")
-        except Exception as e:
-            print(f"⚠ OCR problem: {e}")
-
-    def analyze_image(self, image: np.ndarray) -> Dict[str, Any]:
-        """Kompletna analiza obrazu"""
-        results = {
-            'templates': self.template_matcher.find_all_templates(image),
-            'colors': self.detect_health_mana_bars(image),
-            'text': self.extract_text_regions(image) if self.ocr_available else [],
-            'ui_elements': self.detect_ui_elements(image)
         }
 
         return results
@@ -950,6 +868,58 @@ class VisionEngine:
             print(f"Błąd podczas wykrywania elementów UI: {e}")
             return {'elements': []}
 
+    def visualize_results(self, image: np.ndarray, results: Dict[str, Any]) -> np.ndarray:
+        """Narysuj wyniki analizy na obrazie"""
+        vis_image = image.copy()
+
+        try:
+            # Rysuj dopasowane wzorce
+            if 'templates' in results:
+                for template_name, matches in results['templates'].items():
+                    for match in matches:
+                        cv2.rectangle(vis_image,
+                                      (match['x'], match['y']),
+                                      (match['x'] + match['width'], match['y'] + match['height']),
+                                      (0, 255, 0), 2)
+                        label = f"{template_name.split('/')[-1]}: {match['confidence']:.2f}"
+                        cv2.putText(vis_image, label,
+                                    (match['x'], match['y'] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # Rysuj paski HP/Mana
+            if 'colors' in results:
+                for bar in results['colors'].get('health_bars', []):
+                    cv2.rectangle(vis_image,
+                                  (bar['x'], bar['y']),
+                                  (bar['x'] + bar['width'], bar['y'] + bar['height']),
+                                  (0, 0, 255), 2)
+                    cv2.putText(vis_image, "HP",
+                                (bar['x'], bar['y'] - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+                for bar in results['colors'].get('mana_bars', []):
+                    cv2.rectangle(vis_image,
+                                  (bar['x'], bar['y']),
+                                  (bar['x'] + bar['width'], bar['y'] + bar['height']),
+                                  (255, 0, 0), 2)
+                    cv2.putText(vis_image, "MANA",
+                                (bar['x'], bar['y'] - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+
+            # Rysuj wykryty tekst
+            if 'text' in results:
+                for text_info in results['text']:
+                    cv2.rectangle(vis_image,
+                                  (text_info['x'], text_info['y']),
+                                  (text_info['x'] + text_info['width'], text_info['y'] + text_info['height']),
+                                  (255, 255, 0), 1)
+
+            return vis_image
+
+        except Exception as e:
+            print(f"Błąd podczas wizualizacji: {e}")
+            return vis_image
+
     def create_template_from_region(self, image: np.ndarray, x: int, y: int,
                                     width: int, height: int, name: str,
                                     category: str = "ui", description: str = "") -> bool:
@@ -990,57 +960,28 @@ class VisionEngine:
         """Pobierz template matcher"""
         return self.template_matcher
 
-    def visualize_results(self, image: np.ndarray, results: Dict[str, Any]) -> np.ndarray:
-        """Narysuj wyniki analizy na obrazie"""
-        vis_image = image.copy()
-
+    def save_ocr_regions(self, regions: Dict[str, Tuple[int, int, int, int]]) -> bool:
+        """Zapisz lokalizacje regionów OCR do pliku"""
         try:
-            # Rysuj dopasowane wzorce
-            if 'templates' in results:
-                for template_name, matches in results['templates'].items():
-                    for match in matches:
-                        # Prostokąt wokół dopasowania
-                        cv2.rectangle(vis_image,
-                                      (match['x'], match['y']),
-                                      (match['x'] + match['width'], match['y'] + match['height']),
-                                      (0, 255, 0), 2)
-
-                        # Etykieta
-                        label = f"{template_name.split('/')[-1]}: {match['confidence']:.2f}"
-                        cv2.putText(vis_image, label,
-                                    (match['x'], match['y'] - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-            # Rysuj paski HP/Mana
-            if 'colors' in results:
-                for bar in results['colors'].get('health_bars', []):
-                    cv2.rectangle(vis_image,
-                                  (bar['x'], bar['y']),
-                                  (bar['x'] + bar['width'], bar['y'] + bar['height']),
-                                  (0, 0, 255), 2)  # Czerwony dla HP
-                    cv2.putText(vis_image, "HP",
-                                (bar['x'], bar['y'] - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-
-                for bar in results['colors'].get('mana_bars', []):
-                    cv2.rectangle(vis_image,
-                                  (bar['x'], bar['y']),
-                                  (bar['x'] + bar['width'], bar['y'] + bar['height']),
-                                  (255, 0, 0), 2)  # Niebieski dla Mana
-                    cv2.putText(vis_image, "MANA",
-                                (bar['x'], bar['y'] - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-
-            # Rysuj wykryty tekst
-            if 'text' in results:
-                for text_info in results['text']:
-                    cv2.rectangle(vis_image,
-                                  (text_info['x'], text_info['y']),
-                                  (text_info['x'] + text_info['width'], text_info['y'] + text_info['height']),
-                                  (255, 255, 0), 1)  # Żółty dla tekstu
-
-            return vis_image
-
+            regions_file = Path(self.config['paths']['data']) / 'ocr_regions.json'
+            with open(regions_file, 'w') as f:
+                json.dump(regions, f, indent=4)
+            logging.info(f"Zapisano lokalizacje OCR do {regions_file}")
+            return True
         except Exception as e:
-            print(f"Błąd podczas wizualizacji: {e}")
-            return vis_image
+            logging.error(f"Błąd podczas zapisywania lokalizacji OCR: {e}")
+            return False
+
+    def load_ocr_regions(self) -> Dict[str, Tuple[int, int, int, int]]:
+        """Wczytaj lokalizacje regionów OCR z pliku"""
+        try:
+            regions_file = Path(self.config['paths']['data']) / 'ocr_regions.json'
+            if regions_file.exists():
+                with open(regions_file, 'r') as f:
+                    regions = json.load(f)
+                logging.info(f"Wczytano lokalizacje OCR z {regions_file}")
+                return regions
+            return {}
+        except Exception as e:
+            logging.error(f"Błąd podczas wczytywania lokalizacji OCR: {e}")
+            return {}

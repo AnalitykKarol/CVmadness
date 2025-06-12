@@ -9,13 +9,16 @@ from datetime import datetime
 class TemplateMatcher:
     """Klasa do dopasowywania wzorców (template matching)"""
 
-    def __init__(self, templates_dir: str = "data/templates"):
-        self.templates_dir = templates_dir
+    def __init__(self, config: Dict[str, Any]):
+        if isinstance(config, dict) and 'paths' in config and 'templates' in config['paths']:
+            self.templates_dir = config['paths']['templates']
+        else:
+            self.templates_dir = "data/templates"
         self.templates = {}  # Załadowane wzorce
         self.template_info = {}  # Metadane wzorców
 
         # Utwórz folder jeśli nie istnieje
-        os.makedirs(templates_dir, exist_ok=True)
+        os.makedirs(self.templates_dir, exist_ok=True)
 
         # Załaduj istniejące wzorce
         self.load_all_templates()

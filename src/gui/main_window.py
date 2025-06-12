@@ -5,126 +5,230 @@ import tkinter as tk
 import tkinter.simpledialog
 from datetime import datetime
 from tkinter import ttk, messagebox
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import logging
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 from capture.window_capture import WindowCapture
 from input.input_controller import InputController
-from ..automation.automation_manager import AutomationManager
+from automation.automation_manager import AutomationManager
+from vision.vision_engine import VisionEngine
 
 class MainWindow:
     """Główne okno aplikacji"""
 
     def __init__(self, config: Dict[str, Any]):
-        self.config = config
+        """Initialize main window"""
         self.root = tk.Tk()
-        self.root.title("WoW Automation - Computer Vision")
+        self.root.title("WoW Automation")
         self.config = config
-        self.vision_engine = VisionEngine()
 
-        # Initialize automation
-        self.automation = AutomationManager(config, self.vision_engine)
-        gui_config = config['gui']
-        self.root.geometry(f"{gui_config['window_width']}x{gui_config['window_height']}")
-
-        # Inicjalizacja komponentów
+        # Initialize window capture
+        from capture.window_capture import WindowCapture
         self.window_capture = WindowCapture(config)
-        self.input_controller = None
-        self.vision_engine = None
 
-        # GUI elementy
-        self.preview_label = None
+        # Initialize status variables
         self.status_var = tk.StringVar(value="Nie połączono z aplikacją")
         self.capture_active = False
+        self.target_window_var = tk.StringVar(value="World of Warcraft")
 
-        # Ustawienia użytkownika
+        # OCR variables - ZMIANA: najpierw ustaw domyślne wartości
+        self.ocr_x_var = tk.StringVar(value="120")
+        self.ocr_y_var = tk.StringVar(value="65")
+        self.ocr_w_var = tk.StringVar(value="80")
+        self.ocr_h_var = tk.StringVar(value="20")
+        self.last_manual_ocr = None
+
+        # HP and Mana regions - ZMIANA: pozostaw jako None, będą załadowane z config
+        self.hp_region = None
+        self.mana_region = None
+        self.hp_value_var = tk.StringVar(value="HP: --")
+        self.mana_value_var = tk.StringVar(value="Mana: --")
+
+        # Color variables
+        self.color_pick_x_var = tk.StringVar(value="150")
+        self.color_pick_y_var = tk.StringVar(value="70")
+        self.color_region_x_var = tk.StringVar(value="100")
+        self.color_region_y_var = tk.StringVar(value="60")
+        self.color_region_w_var = tk.StringVar(value="200")
+        self.color_region_h_var = tk.StringVar(value="50")
+        self.color_tolerance_var = tk.StringVar(value="15")
+        self.current_color_var = tk.StringVar(value="RGB: N/A")
+        self.current_hsv_var = tk.StringVar(value="HSV: N/A")
+
+        # Template variables
+        self.template_var = tk.StringVar()
+        self.template_list = []
+
+        # User settings
         self.saved_colors = {}
         self.current_picked_color = None
         self.user_settings_file = "config/user_settings.json"
+        self.saved_regions_var = tk.StringVar(value="")
+        self.saved_colors_var = tk.StringVar(value="")
+
+        # Initialize vision engine
+        try:
+            from vision.vision_engine import VisionEngine
+            self.vision_engine = VisionEngine(config)
+        except ImportError as e:
+            messagebox.showerror("Error", f"Failed to load Vision Engine: {e}")
+            self.vision_engine = None
 
         # Setup GUI
         self.setup_ui()
 
-        # Załaduj zapisane ustawienia
+        # Initialize automation with log widget
+        from automation.automation_manager import AutomationManager
+        self.automation = AutomationManager(config, self.vision_engine, self.info_text)
+
+        # ZMIANA: Load saved settings - MUSI BYĆ PO setup_ui()
         self.load_user_settings()
 
-        # Setup auto-save bindings
+        # ZMIANA: Setup auto-save bindings - PO załadowaniu ustawień
         self.setup_auto_save_bindings()
 
         # Start preview update
         self.update_preview()
 
+        # Set up closing handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
     def load_user_settings(self):
-        """Załaduj zapisane ustawienia użytkownika"""
+        """Load saved user settings"""
         try:
+            # Najpierw załaduj domyślne wartości z głównej konfiguracji
+            self.load_default_settings()
+
+            # Następnie sprawdź czy istnieje plik user_settings i nadpisz wartości
             if os.path.exists(self.user_settings_file):
                 with open(self.user_settings_file, 'r', encoding='utf-8') as f:
-                    user_settings = json.load(f)
+                    settings = json.load(f)
 
-                # Załaduj okno target
-                if 'target_window' in user_settings:
-                    self.target_window_var.set(user_settings['target_window'])
-                    print(f"✓ Załadowano okno: {user_settings['target_window']}")
+                # Load target window
+                if 'target_window' in settings:
+                    self.target_window_var.set(settings['target_window'])
 
-                # Załaduj regiony OCR
-                if 'ocr_regions' in user_settings:
-                    ocr = user_settings['ocr_regions']
+                # Load OCR regions
+                if 'ocr_regions' in settings:
+                    ocr = settings['ocr_regions']
                     if 'current' in ocr:
-                        self.ocr_x_var.set(str(ocr['current'].get('x', '120')))
-                        self.ocr_y_var.set(str(ocr['current'].get('y', '65')))
-                        self.ocr_w_var.set(str(ocr['current'].get('w', '80')))
-                        self.ocr_h_var.set(str(ocr['current'].get('h', '20')))
+                        self.ocr_x_var.set(str(ocr['current'].get('x', self.ocr_x_var.get())))
+                        self.ocr_y_var.set(str(ocr['current'].get('y', self.ocr_y_var.get())))
+                        self.ocr_w_var.set(str(ocr['current'].get('w', self.ocr_w_var.get())))
+                        self.ocr_h_var.set(str(ocr['current'].get('h', self.ocr_h_var.get())))
 
-                    if 'hp_region' in ocr:
-                        self.hp_region = tuple(ocr['hp_region'])
-                        print(f"✓ Załadowano HP region: {self.hp_region}")
+                    # Load HP and Mana regions
+                    if 'hp' in ocr:
+                        self.hp_region = tuple(ocr['hp'])
+                    if 'mana' in ocr:
+                        self.mana_region = tuple(ocr['mana'])
 
-                    if 'mana_region' in ocr:
-                        self.mana_region = tuple(ocr['mana_region'])
-                        print(f"✓ Załadowano Mana region: {self.mana_region}")
-
-                    self.update_saved_regions_display()
-
-                # Załaduj regiony kolorów
-                if 'color_regions' in user_settings:
-                    color = user_settings['color_regions']
+                # Load color regions
+                if 'color_regions' in settings:
+                    color = settings['color_regions']
                     if 'current' in color:
-                        self.color_pick_x_var.set(str(color['current'].get('x', '150')))
-                        self.color_pick_y_var.set(str(color['current'].get('y', '70')))
-                        self.color_region_x_var.set(str(color['current'].get('region_x', '100')))
-                        self.color_region_y_var.set(str(color['current'].get('region_y', '60')))
-                        self.color_region_w_var.set(str(color['current'].get('region_w', '200')))
-                        self.color_region_h_var.set(str(color['current'].get('region_h', '50')))
-                        self.color_tolerance_var.set(str(color['current'].get('tolerance', '15')))
+                        self.color_pick_x_var.set(str(color['current'].get('x', self.color_pick_x_var.get())))
+                        self.color_pick_y_var.set(str(color['current'].get('y', self.color_pick_y_var.get())))
+                        self.color_region_x_var.set(
+                            str(color['current'].get('region_x', self.color_region_x_var.get())))
+                        self.color_region_y_var.set(
+                            str(color['current'].get('region_y', self.color_region_y_var.get())))
+                        self.color_region_w_var.set(
+                            str(color['current'].get('region_w', self.color_region_w_var.get())))
+                        self.color_region_h_var.set(
+                            str(color['current'].get('region_h', self.color_region_h_var.get())))
+                        self.color_tolerance_var.set(
+                            str(color['current'].get('tolerance', self.color_tolerance_var.get())))
 
-                # Załaduj zapisane kolory
-                if 'saved_colors' in user_settings:
-                    self.saved_colors = user_settings['saved_colors']
-                    self.update_saved_colors_display()
-                    print(f"✓ Załadowano {len(self.saved_colors)} zapisanych kolorów")
+                # Load saved colors
+                if 'saved_colors' in settings:
+                    self.saved_colors = settings['saved_colors']
 
-                # Załaduj ostatni wybrany kolor
-                if 'current_picked_color' in user_settings and user_settings['current_picked_color']:
-                    self.current_picked_color = user_settings['current_picked_color']
-                    if self.current_picked_color:
-                        self.current_color_var.set(f"RGB: {self.current_picked_color['rgb']}")
-                        self.current_hsv_var.set(f"HSV: {self.current_picked_color['hsv']}")
-
-                print("✓ Ustawienia użytkownika załadowane")
-
+                logging.info("User settings loaded successfully")
             else:
-                print("ℹ Brak zapisanych ustawień - używam domyślnych")
+                logging.info("No user_settings.json found, using default values from config")
 
         except Exception as e:
-            print(f"⚠ Błąd ładowania ustawień: {e}")
-            messagebox.showwarning("Uwaga", f"Nie udało się załadować ustawień: {e}")
+            logging.error(f"Error loading settings: {e}")
+            # W przypadku błędu, upewnij się że są załadowane domyślne wartości
+            self.load_default_settings()
+
+    def load_default_settings(self):
+        """Load default settings from main config"""
+        try:
+            # Załaduj domyślne okno target
+            if 'window' in self.config and 'target_titles' in self.config['window']:
+                default_target = self.config['window']['target_titles'][0]
+                if not self.target_window_var.get():
+                    self.target_window_var.set(default_target)
+
+            # Załaduj domyślne regiony OCR z konfiguracji
+            if 'vision' in self.config and 'ocr' in self.config['vision'] and 'regions' in self.config['vision']['ocr']:
+                ocr_regions = self.config['vision']['ocr']['regions']
+
+                # HP region
+                if 'hp' in ocr_regions:
+                    hp_region = ocr_regions['hp']
+                    if not self.hp_region:
+                        self.hp_region = (hp_region['x'], hp_region['y'], hp_region['width'], hp_region['height'])
+
+                    # Ustaw jako current region jeśli nie jest ustawiony
+                    if not self.ocr_x_var.get() or self.ocr_x_var.get() == "120":
+                        self.ocr_x_var.set(str(hp_region['x']))
+                        self.ocr_y_var.set(str(hp_region['y']))
+                        self.ocr_w_var.set(str(hp_region['width']))
+                        self.ocr_h_var.set(str(hp_region['height']))
+
+                # Mana region
+                if 'mana' in ocr_regions:
+                    mana_region = ocr_regions['mana']
+                    if not self.mana_region:
+                        self.mana_region = (
+                        mana_region['x'], mana_region['y'], mana_region['width'], mana_region['height'])
+
+            # Alternatywnie, sprawdź starszą strukturę konfiguracji
+            elif 'ocr_regions' in self.config:
+                if 'hp_region' in self.config['ocr_regions'] and not self.hp_region:
+                    hp_data = self.config['ocr_regions']['hp_region']
+                    self.hp_region = tuple(hp_data)
+
+                    # Ustaw jako current region jeśli nie jest ustawiony
+                    if not self.ocr_x_var.get() or self.ocr_x_var.get() == "120":
+                        self.ocr_x_var.set(str(hp_data[0]))
+                        self.ocr_y_var.set(str(hp_data[1]))
+                        self.ocr_w_var.set(str(hp_data[2]))
+                        self.ocr_h_var.set(str(hp_data[3]))
+
+                if 'mana_region' in self.config['ocr_regions'] and not self.mana_region:
+                    mana_data = self.config['ocr_regions']['mana_region']
+                    self.mana_region = tuple(mana_data)
+
+            # Aktualizuj wyświetlanie
+            self.update_saved_regions_display()
+
+            logging.info("Default settings loaded from main config")
+
+        except Exception as e:
+            logging.error(f"Error loading default settings: {e}")
+            # Fallback do hard-coded defaults
+            if not self.hp_region:
+                self.hp_region = (270, 125, 50, 29)
+            if not self.mana_region:
+                self.mana_region = (270, 147, 50, 29)
+            if not self.ocr_x_var.get() or self.ocr_x_var.get() == "120":
+                self.ocr_x_var.set("270")
+                self.ocr_y_var.set("125")
+                self.ocr_w_var.set("50")
+                self.ocr_h_var.set("29")
 
     def save_user_settings(self):
-        """Zapisz aktualne ustawienia użytkownika"""
+        """Save user settings"""
         try:
-            user_settings = {
+            settings = {
                 'target_window': self.target_window_var.get(),
                 'ocr_regions': {
                     'current': {
@@ -145,48 +249,41 @@ class MainWindow:
                         'tolerance': int(self.color_tolerance_var.get()) if self.color_tolerance_var.get().isdigit() else 15,
                     }
                 },
-                'saved_colors': self.saved_colors,
-                'current_picked_color': self.current_picked_color
+                'saved_colors': self.saved_colors
             }
-
-            # Dodaj zapisane regiony HP/Mana jeśli istnieją
-            if hasattr(self, 'hp_region'):
-                user_settings['ocr_regions']['hp_region'] = list(self.hp_region)
-
-            if hasattr(self, 'mana_region'):
-                user_settings['ocr_regions']['mana_region'] = list(self.mana_region)
-
-            # Upewnij się, że folder config istnieje
-            os.makedirs('config', exist_ok=True)
-
-            # Zapisz do pliku
+            
+            # Save HP and Mana regions if they exist
+            if self.hp_region:
+                settings['ocr_regions']['hp'] = self.hp_region
+            if self.mana_region:
+                settings['ocr_regions']['mana'] = self.mana_region
+            
             with open(self.user_settings_file, 'w', encoding='utf-8') as f:
-                json.dump(user_settings, f, indent=2, ensure_ascii=False)
-
-            print("✓ Ustawienia zapisane")
-
+                json.dump(settings, f, indent=4)
+            
+            logging.info("User settings saved successfully")
         except Exception as e:
-            print(f"⚠ Błąd zapisywania ustawień: {e}")
+            logging.error(f"Error saving settings: {e}")
 
     def auto_save_settings(self):
-        """Automatycznie zapisz ustawienia po zmianie"""
+        """Auto-save settings when changes are made"""
         # Opóźnienie 1 sekunda żeby nie zapisywać przy każdym ruchu myszy
         if hasattr(self, '_save_timer'):
             self.root.after_cancel(self._save_timer)
-
+        
         self._save_timer = self.root.after(1000, self.save_user_settings)
 
     def setup_auto_save_bindings(self):
-        """Ustaw automatyczne zapisywanie przy zmianach w polach"""
+        """Setup auto-save bindings for settings changes"""
         # Auto-save po zmianie okna target
         self.target_window_var.trace('w', lambda *args: self.auto_save_settings())
-
+        
         # Auto-save po zmianie współrzędnych OCR
         self.ocr_x_var.trace('w', lambda *args: self.auto_save_settings())
         self.ocr_y_var.trace('w', lambda *args: self.auto_save_settings())
         self.ocr_w_var.trace('w', lambda *args: self.auto_save_settings())
         self.ocr_h_var.trace('w', lambda *args: self.auto_save_settings())
-
+        
         # Auto-save po zmianie współrzędnych kolorów
         self.color_pick_x_var.trace('w', lambda *args: self.auto_save_settings())
         self.color_pick_y_var.trace('w', lambda *args: self.auto_save_settings())
@@ -197,73 +294,212 @@ class MainWindow:
         self.color_tolerance_var.trace('w', lambda *args: self.auto_save_settings())
 
     def setup_ui(self):
-        """Skonfiguruj interfejs użytkownika"""
+        """Setup GUI elements"""
         # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Status
-        status_frame = ttk.LabelFrame(main_frame, text="Status", padding="5")
-        status_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        ttk.Label(status_frame, textvariable=self.status_var).grid(row=0, column=0, sticky=tk.W)
+        # Status display
+        status_frame = ttk.Frame(main_frame)
+        status_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
+        # Create notebook for tabs
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Main tab
+        main_tab = ttk.Frame(notebook)
+        notebook.add(main_tab, text="Main")
+
+        # Preview frame
+        preview_frame = ttk.LabelFrame(main_tab, text="Preview")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.preview_label = ttk.Label(preview_frame)
+        self.preview_label.pack(fill=tk.BOTH, expand=True)
+
+        # Info frame
+        info_frame = ttk.LabelFrame(main_tab, text="Window Info")
+        info_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Create text widget for info with scrollbar
+        info_text_frame = ttk.Frame(info_frame)
+        info_text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.info_text = tk.Text(info_text_frame, height=4, wrap=tk.WORD)
+        info_scrollbar = ttk.Scrollbar(info_text_frame, orient="vertical", command=self.info_text.yview)
+        self.info_text.configure(yscrollcommand=info_scrollbar.set)
+        
+        self.info_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        info_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # OCR Data frame
+        ocr_frame = ttk.LabelFrame(main_tab, text="OCR Data")
+        ocr_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Add HP and Mana value display
+        values_frame = ttk.Frame(ocr_frame)
+        values_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.hp_value_var = tk.StringVar(value="HP: --")
+        self.mana_value_var = tk.StringVar(value="Mana: --")
+        
+        ttk.Label(values_frame, textvariable=self.hp_value_var, font=('Arial', 12, 'bold')).pack(side=tk.LEFT, padx=10)
+        ttk.Label(values_frame, textvariable=self.mana_value_var, font=('Arial', 12, 'bold')).pack(side=tk.LEFT, padx=10)
+        
+        # OCR Region input
+        ocr_input_frame = ttk.Frame(ocr_frame)
+        ocr_input_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(ocr_input_frame, text="Region (x, y, w, h):").pack(side=tk.LEFT)
+        
+        # Create entry fields for OCR coordinates
+        coords_frame = ttk.Frame(ocr_input_frame)
+        coords_frame.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Entry(coords_frame, textvariable=self.ocr_x_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(coords_frame, text=",").pack(side=tk.LEFT, padx=2)
+        ttk.Entry(coords_frame, textvariable=self.ocr_y_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(coords_frame, text=",").pack(side=tk.LEFT, padx=2)
+        ttk.Entry(coords_frame, textvariable=self.ocr_w_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(coords_frame, text=",").pack(side=tk.LEFT, padx=2)
+        ttk.Entry(coords_frame, textvariable=self.ocr_h_var, width=6).pack(side=tk.LEFT)
+        
+        # OCR buttons
+        ocr_buttons_frame = ttk.Frame(ocr_frame)
+        ocr_buttons_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Button(ocr_buttons_frame, text="Test OCR", command=self.test_manual_ocr).pack(side=tk.LEFT, padx=5)
+        ttk.Button(ocr_buttons_frame, text="Set HP Region", command=self.set_hp_region).pack(side=tk.LEFT, padx=5)
+        ttk.Button(ocr_buttons_frame, text="Set Mana Region", command=self.set_mana_region).pack(side=tk.LEFT, padx=5)
+        ttk.Button(ocr_buttons_frame, text="Show Region", command=self.show_ocr_region).pack(side=tk.LEFT, padx=5)
+        ttk.Button(ocr_buttons_frame, text="Debug Regions", command=self.debug_hp_mana_regions).pack(side=tk.LEFT,
+                                                                                                     padx=5)
+        
+        # Create text widget for OCR results with scrollbar
+        ocr_text_frame = ttk.Frame(ocr_frame)
+        ocr_text_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.ocr_text = tk.Text(ocr_text_frame, height=6, wrap=tk.WORD)
+        ocr_scrollbar = ttk.Scrollbar(ocr_text_frame, orient="vertical", command=self.ocr_text.yview)
+        self.ocr_text.configure(yscrollcommand=ocr_scrollbar.set)
+        
+        self.ocr_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ocr_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Control buttons frame
+        control_frame = ttk.Frame(main_tab)
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
 
         # Target window controls
-        target_frame = ttk.LabelFrame(main_frame, text="Wybór Okna", padding="5")
-        target_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        ttk.Label(target_frame, text="Okno docelowe:").grid(row=0, column=0, sticky=tk.W)
-        self.target_window_var = tk.StringVar(value="World of Warcraft")
-        target_entry = ttk.Entry(target_frame, textvariable=self.target_window_var, width=30)
-        target_entry.grid(row=0, column=1, padx=(5, 0))
-
-        ttk.Button(target_frame, text="Ustaw Okno",
-                  command=self.set_target_window).grid(row=0, column=2, padx=(5, 0))
-
-        # Window controls - Left side
-        window_frame = ttk.LabelFrame(main_frame, text="Kontrola Okna", padding="5")
-        window_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
-
-        ttk.Button(window_frame, text="Znajdź Okno",
-                   command=self.find_window).grid(row=0, column=0, pady=2, sticky=tk.W)
-
-        ttk.Button(window_frame, text="Start Przechwytywania",
-                   command=self.start_capture).grid(row=1, column=0, pady=2, sticky=tk.W)
-
-        ttk.Button(window_frame, text="Stop Przechwytywania",
-                   command=self.stop_capture).grid(row=2, column=0, pady=2, sticky=tk.W)
-
-        ttk.Button(window_frame, text="Zapisz Screenshot",
-                   command=self.save_screenshot).grid(row=3, column=0, pady=2, sticky=tk.W)
+        target_frame = ttk.LabelFrame(control_frame, text="Target Window")
+        target_frame.pack(fill=tk.X, pady=5)
+        
+        # Add target window entry
+        target_entry_frame = ttk.Frame(target_frame)
+        target_entry_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(target_entry_frame, text="Window Title:").pack(side=tk.LEFT)
+        target_entry = ttk.Entry(target_entry_frame, textvariable=self.target_window_var, width=30)
+        target_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Add target window buttons
+        target_buttons_frame = ttk.Frame(target_frame)
+        target_buttons_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(target_buttons_frame, text="Set Target Window", command=self.set_target_window).pack(side=tk.LEFT, padx=5)
+        ttk.Button(target_buttons_frame, text="Find Window", command=self.find_window).pack(side=tk.LEFT, padx=5)
+        ttk.Button(target_buttons_frame, text="Start Capture", command=self.start_capture).pack(side=tk.LEFT, padx=5)
+        ttk.Button(target_buttons_frame, text="Stop Capture", command=self.stop_capture).pack(side=tk.LEFT, padx=5)
+        ttk.Button(target_buttons_frame, text="Save Screenshot", command=self.save_screenshot).pack(side=tk.LEFT, padx=5)
 
         # Input controls
-        self._setup_input_controls(window_frame)
+        input_frame = ttk.LabelFrame(control_frame, text="Input Controls")
+        input_frame.pack(fill=tk.X, pady=5)
+        
+        # Click test
+        click_frame = ttk.Frame(input_frame)
+        click_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(click_frame, text="Test Click (x, y):").pack(side=tk.LEFT)
+        self.click_x_var = tk.StringVar(value="400")
+        self.click_y_var = tk.StringVar(value="300")
+        
+        click_coords_frame = ttk.Frame(click_frame)
+        click_coords_frame.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Entry(click_coords_frame, textvariable=self.click_x_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(click_coords_frame, text=",").pack(side=tk.LEFT, padx=2)
+        ttk.Entry(click_coords_frame, textvariable=self.click_y_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(click_coords_frame, text="Click", command=self.test_click).pack(side=tk.LEFT, padx=5)
+        
+        # Key test
+        key_frame = ttk.Frame(input_frame)
+        key_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(key_frame, text="Test Key:").pack(side=tk.LEFT)
+        self.key_var = tk.StringVar(value="space")
+        self.key_method_var = tk.StringVar(value="auto")
+        
+        key_input_frame = ttk.Frame(key_frame)
+        key_input_frame.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Entry(key_input_frame, textvariable=self.key_var, width=15).pack(side=tk.LEFT)
+        ttk.Label(key_input_frame, text="Method:").pack(side=tk.LEFT, padx=5)
+        method_combo = ttk.Combobox(key_input_frame, textvariable=self.key_method_var,
+                                  values=["auto", "winapi", "pyautogui", "ctypes"], width=10)
+        method_combo.pack(side=tk.LEFT, padx=5)
+        ttk.Button(key_input_frame, text="Send Key", command=self.test_key).pack(side=tk.LEFT, padx=5)
+        ttk.Button(key_input_frame, text="Test Methods", command=self.test_key_methods).pack(side=tk.LEFT, padx=5)
 
         # Vision controls
-        self._setup_vision_controls(window_frame)
+        vision_frame = ttk.LabelFrame(control_frame, text="Vision Controls")
+        vision_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(vision_frame, text="Analyze Image", command=self.analyze_current_image).pack(side=tk.LEFT, padx=5)
+        ttk.Button(vision_frame, text="Visualize Results", command=self.visualize_results).pack(side=tk.LEFT, padx=5)
 
-        # Preview - Right side
-        preview_frame = ttk.LabelFrame(main_frame, text="Podgląd", padding="5")
-        preview_frame.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
+        # Template controls
+        template_frame = ttk.LabelFrame(control_frame, text="Template Controls")
+        template_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(template_frame, text="Update Templates", command=self.update_template_list).pack(side=tk.LEFT, padx=5)
+        ttk.Button(template_frame, text="Find Template", command=self.find_template).pack(side=tk.LEFT, padx=5)
+        ttk.Button(template_frame, text="Find & Click", command=self.find_and_click_template).pack(side=tk.LEFT, padx=5)
+        ttk.Button(template_frame, text="Create Template", command=self.create_template).pack(side=tk.LEFT, padx=5)
+        ttk.Button(template_frame, text="Delete Template", command=self.delete_template).pack(side=tk.LEFT, padx=5)
+        ttk.Button(template_frame, text="Show Template", command=self.show_template).pack(side=tk.LEFT, padx=5)
 
-        self.preview_label = ttk.Label(preview_frame, text="Brak podglądu")
-        self.preview_label.grid(row=0, column=0)
+        # Settings tab
+        settings_tab = ttk.Frame(notebook)
+        notebook.add(settings_tab, text="Settings")
 
-        # Results area - Bottom
-        info_frame = ttk.LabelFrame(main_frame, text="Informacje / Wyniki CV", padding="5")
-        info_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        # Color settings
+        color_frame = ttk.LabelFrame(settings_tab, text="Color Settings")
+        color_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(color_frame, text="Save HP Color", command=self.save_hp_color).pack(side=tk.LEFT, padx=5)
+        ttk.Button(color_frame, text="Save Mana Color", command=self.save_mana_color).pack(side=tk.LEFT, padx=5)
+        ttk.Button(color_frame, text="Save Custom Color", command=self.save_custom_color).pack(side=tk.LEFT, padx=5)
+        ttk.Button(color_frame, text="Test All Colors", command=self.test_all_saved_colors).pack(side=tk.LEFT, padx=5)
 
-        self.info_text = tk.Text(info_frame, height=8, width=80)
-        self.info_text.grid(row=0, column=0)
+        # Saved regions display
+        regions_frame = ttk.LabelFrame(settings_tab, text="Saved Regions")
+        regions_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.regions_text = tk.Text(regions_frame, height=4, wrap=tk.WORD)
+        self.regions_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        scrollbar = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.info_text.yview)
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.info_text.configure(yscrollcommand=scrollbar.set)
+        # Saved colors display
+        colors_frame = ttk.LabelFrame(settings_tab, text="Saved Colors")
+        colors_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.colors_text = tk.Text(colors_frame, height=4, wrap=tk.WORD)
+        self.colors_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Configure weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(2, weight=1)
+        # Update saved regions and colors display
+        self.update_saved_regions_display()
+        self.update_saved_colors_display()
+
+        # Bind mousewheel to text widgets
+        def _on_mousewheel(event):
+            for widget in [self.regions_text, self.colors_text, self.ocr_text, self.info_text]:
+                widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        for widget in [self.regions_text, self.colors_text, self.ocr_text, self.info_text]:
+            widget.bind("<MouseWheel>", _on_mousewheel)
 
     def _setup_input_controls(self, parent):
         """Skonfiguruj kontrolki inputu"""
@@ -459,10 +695,10 @@ class MainWindow:
         ttk.Entry(color_frame, textvariable=self.color_tolerance_var, width=8).grid(row=3, column=0, sticky=tk.W)
 
         # Current color display
-        self.current_color_var = tk.StringVar(value="RGB: nie wybrano")
+        self.current_color_var = tk.StringVar(value="RGB: N/A")
         ttk.Label(color_frame, textvariable=self.current_color_var, foreground="blue").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
 
-        self.current_hsv_var = tk.StringVar(value="HSV: nie wybrano")
+        self.current_hsv_var = tk.StringVar(value="HSV: N/A")
         ttk.Label(color_frame, textvariable=self.current_hsv_var, foreground="green").grid(row=5, column=0, sticky=tk.W)
 
         # Color region definition
@@ -532,6 +768,9 @@ class MainWindow:
             # Inicjalizuj input controller
             coord_manager = self.window_capture.get_coordinate_manager()
             self.input_controller = InputController(coord_manager, self.config)
+            
+            # Przekaż input controller do automation manager
+            self.automation.set_input_controller(self.input_controller)
 
             self.update_window_info()
             messagebox.showinfo("Sukces", "Znaleziono okno docelowe!")
@@ -581,7 +820,7 @@ class MainWindow:
             screenshot_rgb = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
             im = Image.fromarray(screenshot_rgb)
             im.save(default_path)
-            print(f"✓ Screenshot zapisany: {default_path}")
+            logging.info(f"✓ Screenshot zapisany: {default_path}")
         else:
             messagebox.showerror("Błąd", "Nie udało się zrobić screena.")
 
@@ -651,6 +890,8 @@ class MainWindow:
             w = int(self.ocr_w_var.get())
             h = int(self.ocr_h_var.get())
 
+            logging.info(f"Test OCR dla regionu ({x}, {y}, {w}, {h})")
+
             screenshot = self.window_capture.capture_window_screenshot()
             if screenshot is not None:
                 img_height, img_width = screenshot.shape[:2]
@@ -659,7 +900,17 @@ class MainWindow:
                     return
 
                 roi = screenshot[y:y + h, x:x + w]
+                
+                # Zapisz region do debugowania
+                debug_dir = os.path.join(self.config['paths']['screenshots'], 'debug')
+                os.makedirs(debug_dir, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                debug_file = os.path.join(debug_dir, f'ocr_region_{timestamp}.png')
+                cv2.imwrite(debug_file, roi)
+                logging.info(f"Zapisano region OCR do: {debug_file}")
+
                 ocr_results = self.vision_engine.test_manual_ocr_region(roi, x, y, w, h)
+                logging.info(f"Wyniki OCR: {ocr_results}")
 
                 result_text = f"OCR Region ({x}, {y}, {w}, {h}):\n\n"
                 for config_name, text in ocr_results.items():
@@ -677,6 +928,7 @@ class MainWindow:
         except ValueError:
             messagebox.showerror("Błąd", "Nieprawidłowe współrzędne")
         except Exception as e:
+            logging.error(f"Błąd OCR: {e}", exc_info=True)
             messagebox.showerror("Błąd", f"Błąd OCR: {e}")
 
     def set_hp_region(self):
@@ -712,10 +964,26 @@ class MainWindow:
             messagebox.showerror("Błąd", "Nieprawidłowe współrzędne")
 
     def update_saved_regions_display(self):
-        """Aktualizuj wyświetlanie zapisanych regionów"""
-        hp_text = f"HP: {getattr(self, 'hp_region', 'brak')}"
-        mana_text = f"Mana: {getattr(self, 'mana_region', 'brak')}"
-        self.saved_regions_var.set(f"{hp_text}, {mana_text}")
+        """Update the display of saved regions"""
+        try:
+            regions_text = ""
+            
+            if self.hp_region:
+                regions_text += f"HP: ({self.hp_region[0]}, {self.hp_region[1]}, {self.hp_region[2]}, {self.hp_region[3]})\n"
+            else:
+                regions_text += "HP: brak\n"
+                
+            if self.mana_region:
+                regions_text += f"Mana: ({self.mana_region[0]}, {self.mana_region[1]}, {self.mana_region[2]}, {self.mana_region[3]})"
+            else:
+                regions_text += "Mana: brak"
+            
+            self.regions_text.delete(1.0, tk.END)
+            self.regions_text.insert(tk.END, regions_text)
+        except Exception as e:
+            logging.error(f"Failed to update regions display: {e}")
+            self.regions_text.delete(1.0, tk.END)
+            self.regions_text.insert(tk.END, "Error: Failed to load regions")
 
     def show_ocr_region(self):
         """Pokaż region OCR na screenshocie"""
@@ -1035,88 +1303,43 @@ class MainWindow:
     # ===== COMPUTER VISION METHODS =====
 
     def analyze_current_image(self):
-        """Analizuj aktualny obraz używając Computer Vision"""
-        if not self.vision_engine:
-            try:
-                from vision.vision_engine import VisionEngine
-                self.vision_engine = VisionEngine(self.config)
-            except ImportError as e:
-                messagebox.showerror("Błąd", f"Nie można załadować Vision Engine: {e}")
+        """Analyze current image and update OCR data display"""
+        if not self.window_capture.is_capturing:
+            messagebox.showwarning("Warning", "No active capture")
+            return
+
+        try:
+            # Get current frame
+            frame = self.window_capture.get_latest_frame()
+            if frame is None:
                 return
 
-        screenshot = self.window_capture.capture_window_screenshot()
-        if screenshot is not None:
-            try:
-                results = self.vision_engine.analyze_image(screenshot)
-                self.last_cv_results = results
+            # Analyze HP region
+            hp_region = self.config['vision']['regions']['hp']  # (x, y, w, h)
+            x, y, w, h = hp_region
+            hp_image = frame[y:y + h, x:x + w]
+            hp_text = self.vision_engine.ocr_engine.read_text(hp_image)
+            hp_value = self.vision_engine.ocr_engine.extract_numbers(hp_text)
 
-                info_text = "=== ANALIZA COMPUTER VISION ===\n"
-                info_text += f"Obraz: {screenshot.shape[1]}x{screenshot.shape[0]} pikseli\n\n"
+            # Analyze Mana region
+            mana_region = self.config['vision']['regions']['mana']  # (x, y, w, h)
+            x, y, w, h = mana_region
+            mana_image = frame[y:y + h, x:x + w]
+            mana_text = self.vision_engine.ocr_engine.read_text(mana_image)
+            mana_value = self.vision_engine.ocr_engine.extract_numbers(mana_text)
 
-                # Templates
-                if results['templates']:
-                    info_text += "ZNALEZIONE WZORCE:\n"
-                    for template_name, matches in results['templates'].items():
-                        info_text += f"• {template_name}: {len(matches)} dopasowań\n"
-                        for match in matches[:3]:
-                            info_text += f"  └─ Pozycja: ({match['center_x']}, {match['center_y']}), Pewność: {match['confidence']:.2f}\n"
-                    info_text += "\n"
-                else:
-                    info_text += "WZORCE: Brak dopasowań\n\n"
+            # Update OCR data display
+            self.ocr_text.delete(1.0, tk.END)
+            self.ocr_text.insert(tk.END, f"HP Region Raw Text: {hp_text}\n")
+            self.ocr_text.insert(tk.END, f"HP Extracted Value: {hp_value}\n")
+            self.ocr_text.insert(tk.END, f"Mana Region Raw Text: {mana_text}\n")
+            self.ocr_text.insert(tk.END, f"Mana Extracted Value: {mana_value}\n")
 
-                # HP/Mana bars
-                health_count = len(results['colors']['health_bars'])
-                mana_count = len(results['colors']['mana_bars'])
-                info_text += f"PASKI STATUSU:\n• HP: {health_count} pasków\n• Mana: {mana_count} pasków\n"
+            # Update preview with visualization
+            self.visualize_results()
 
-                if health_count > 0:
-                    for i, bar in enumerate(results['colors']['health_bars'][:3]):
-                        info_text += f"  └─ HP{i + 1}: ({bar['center_x']}, {bar['center_y']}) {bar['width']}x{bar['height']}px\n"
-
-                if mana_count > 0:
-                    for i, bar in enumerate(results['colors']['mana_bars'][:3]):
-                        info_text += f"  └─ Mana{i + 1}: ({bar['center_x']}, {bar['center_y']}) {bar['width']}x{bar['height']}px\n"
-
-                info_text += "\n"
-
-                # Text (OCR)
-                if results['text']:
-                    info_text += f"ROZPOZNANY TEKST: {len(results['text'])} regionów\n"
-                    for text_info in results['text'][:5]:
-                        clean_text = text_info['text'].replace('\n', ' ').strip()
-                        if clean_text:
-                            info_text += f"• '{clean_text}' na ({text_info['x']}, {text_info['y']})\n"
-                else:
-                    info_text += "TEKST: Brak rozpoznanego tekstu\n"
-
-                info_text += "\n"
-
-                # UI Elements
-                ui_count = len(results['ui_elements']['elements'])
-                info_text += f"ELEMENTY UI: {ui_count} wykrytych\n"
-
-                button_count = sum(1 for elem in results['ui_elements']['elements'] if elem.get('probable_type') == 'button')
-                panel_count = sum(1 for elem in results['ui_elements']['elements'] if elem.get('probable_type') == 'panel')
-
-                if button_count > 0:
-                    info_text += f"• Przyciski: {button_count}\n"
-                if panel_count > 0:
-                    info_text += f"• Panele: {panel_count}\n"
-
-                info_text += f"\n=== UŻYJ 'Wizualizuj Wyniki' ABY ZOBACZYĆ NA OBRAZIE ==="
-
-                self.info_text.delete(1.0, tk.END)
-                self.info_text.insert(1.0, info_text)
-
-                self.update_template_list()
-                messagebox.showinfo("Analiza", "Analiza CV zakończona - sprawdź wyniki poniżej!")
-
-            except Exception as e:
-                messagebox.showerror("Błąd CV", f"Błąd podczas analizy: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            messagebox.showerror("Błąd", "Brak obrazu do analizy")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to analyze image: {str(e)}")
 
     def visualize_results(self):
         """Pokaż wyniki CV na obrazie"""
@@ -1144,17 +1367,15 @@ class MainWindow:
     # ===== TEMPLATE METHODS =====
 
     def update_template_list(self):
-        """Aktualizuj listę dostępnych templates"""
-        if self.vision_engine:
-            try:
-                templates = self.vision_engine.get_template_matcher().get_template_list()
+        """Aktualizuj listę wzorców w GUI"""
+        try:
+            templates = self.vision_engine.template_matcher.get_template_list()
+            if hasattr(self, 'template_combo'):
                 self.template_combo['values'] = templates
-
                 if templates and not self.template_var.get():
                     self.template_var.set(templates[0])
-
-            except Exception as e:
-                print(f"Błąd aktualizacji listy templates: {e}")
+        except Exception as e:
+            print(f"Błąd aktualizacji listy templates: {e}")
 
     def find_template(self):
         """Znajdź wybrany template"""
@@ -1334,42 +1555,30 @@ class MainWindow:
     # ===== UTILITY METHODS =====
 
     def update_window_info(self):
-        """Aktualizuj informacje o oknie"""
-        window_info = self.window_capture.get_window_info()
-        if window_info:
-            capture_method = "N/A"
-            if hasattr(self.window_capture, 'get_capture_method_info'):
-                capture_method = self.window_capture.get_capture_method_info()
+        """Update window information display"""
+        try:
+            if not self.window_capture.is_capturing:
+                self.info_text.delete(1.0, tk.END)
+                self.info_text.insert(tk.END, "No active window capture")
+                return
 
-            text = f"""INFORMACJE O OKNIE:
-Tytuł: {window_info.get('title', 'N/A')}
-Pozycja: ({window_info.get('left', 0)}, {window_info.get('top', 0)})
-Rozmiar: {window_info.get('width', 0)} x {window_info.get('height', 0)} pikseli
-Prawy dolny róg: ({window_info.get('right', 0)}, {window_info.get('bottom', 0)})
-Metoda przechwytywania: {capture_method}
-
-INSTRUKCJE UŻYCIA:
-1. Kliknij 'Znajdź Okno' aby połączyć się z aplikacją
-2. Użyj 'Start Przechwytywania' aby włączyć podgląd na żywo  
-3. 'Analizuj Obraz' - uruchomi Computer Vision na aktualnym obrazie
-4. Test kliknięć używa współrzędnych względem okna (nie ekranu)
-5. Dostępne klawisze: space, enter, esc, tab, w, a, s, d, 1-9, f1-f12, ctrl,c itp.
-
-COMPUTER VISION:
-• Automatycznie wykrywa: wzorce, paski HP/Mana, tekst, elementy UI
-• Twórz templates: podaj współrzędne regionu i nazwę
-• Znajdź + Klik: automatyczne klikanie w znalezione wzorce
-• Screenshots i wizualizacje są zapisywane w folderze data/screenshots/
-• Templates są zapisywane w folderze data/templates/
-
-KLAWISZE:
-• Testuj różne metody: WinAPI, pyautogui, ctypes
-• Wybierz metodę która działa z Twoim WoW
-• 'Test Wszystkich Metod' sprawdzi automatycznie
-"""
-
+            window_info = self.window_capture.get_window_info()
+            if window_info:
+                info_text = f"Window Title: {window_info['title']}\n"
+                info_text += f"Position: ({window_info['left']}, {window_info['top']})\n"
+                info_text += f"Size: {window_info['width']}x{window_info['height']}\n"
+                if window_info.get('handle') is not None:
+                    info_text += f"Handle: {window_info['handle']}\n"
+                
+                self.info_text.delete(1.0, tk.END)
+                self.info_text.insert(tk.END, info_text)
+            else:
+                self.info_text.delete(1.0, tk.END)
+                self.info_text.insert(tk.END, "No window information available")
+        except Exception as e:
+            logging.error(f"Failed to update window info: {e}")
             self.info_text.delete(1.0, tk.END)
-            self.info_text.insert(1.0, text)
+            self.info_text.insert(tk.END, f"Error: {str(e)}")
 
     def update_preview(self):
         """Aktualizuj podgląd"""
@@ -1379,6 +1588,44 @@ KLAWISZE:
                 if latest:
                     img = latest['image']
                     height, width = img.shape[:2]
+
+                    # DODAJ: Monster Detection - przed skalowaniem obrazu
+                    if hasattr(self, 'vision_engine') and self.vision_engine:
+                        try:
+                            # Wykryj potwory na pełnym obrazie
+                            monsters = self.vision_engine.detect_monsters(img)
+                            if monsters:
+                                # Narysuj wykrycia na obrazie
+                                img = self.vision_engine.monster_detector.draw_detections(img, monsters)
+
+                                # Pokaż info w logach
+                                summary = self.vision_engine.monster_detector.get_detection_summary(monsters)
+                                logging.info(summary)
+
+                                # Opcjonalnie: zapisz info o potworach do GUI
+                                self.info_text.insert(tk.END, f"🎯 {summary}\n")
+                                self.info_text.see(tk.END)
+                        except Exception as e:
+                            logging.error(f"Monster detection error: {e}")
+                    # DODAJ po monster detection:
+                    if hasattr(self, 'vision_engine') and self.vision_engine:
+                        try:
+                            monsters = self.vision_engine.detect_monsters(img)
+                            if monsters:
+                                img = self.vision_engine.monster_detector.draw_detections(img, monsters)
+
+                                # DODAJ: Monster Combat
+                                if hasattr(self, 'automation') and self.automation:
+                                    self.automation.monster_combat.update(img)
+
+                                    # Show combat status
+                                    combat_status = self.automation.monster_combat.get_combat_status()
+                                    if combat_status['has_target']:
+                                        target_info = f"🎯 Target: {combat_status['target_class']} ({combat_status['target_confidence']:.2f})"
+                                        self.info_text.insert(tk.END, f"{target_info}\n")
+                                        self.info_text.see(tk.END)
+                        except Exception as e:
+                            logging.error(f"Combat update error: {e}")
 
                     max_width = self.config['gui']['preview_max_width']
                     max_height = self.config['gui']['preview_max_height']
@@ -1395,28 +1642,152 @@ KLAWISZE:
                     self.preview_label.configure(image=img_tk, text="")
                     self.preview_label.image = img_tk
 
+                    # Update window info
+                    self.update_window_info()
+
+                    # ===== POPRAWIONE HP/MANA OCR =====
+                    # Update HP and Mana values if regions are set
+                    if hasattr(self, 'hp_region') and self.hp_region and hasattr(self,
+                                                                                 'vision_engine') and self.vision_engine:
+                        try:
+                            x, y, w, h = self.hp_region
+                            # POPRAWKA: Przekaż PEŁNY obraz, nie wycięty region
+                            hp_text = self.vision_engine.test_manual_ocr_region(img, x, y, w, h)
+                            if hp_text and 'numbers_only' in hp_text and hp_text['numbers_only']:
+                                self.hp_value_var.set(f"HP: {hp_text['numbers_only']}")
+                            elif hp_text and 'full_text' in hp_text and hp_text['full_text']:
+                                self.hp_value_var.set(f"HP: {hp_text['full_text']}")
+                            elif hp_text and 'default' in hp_text and hp_text['default']:
+                                self.hp_value_var.set(f"HP: {hp_text['default']}")
+                            else:
+                                self.hp_value_var.set("HP: --")
+
+                            print(f"HP OCR wynik: {hp_text}")  # Debug
+                        except Exception as e:
+                            logging.error(f"Error updating HP value: {e}")
+                            self.hp_value_var.set("HP: Error")
+
+                    if hasattr(self, 'mana_region') and self.mana_region and hasattr(self,
+                                                                                     'vision_engine') and self.vision_engine:
+                        try:
+                            x, y, w, h = self.mana_region
+                            # POPRAWKA: Przekaż PEŁNY obraz, nie wycięty region
+                            mana_text = self.vision_engine.test_manual_ocr_region(img, x, y, w, h)
+                            if mana_text and 'numbers_only' in mana_text and mana_text['numbers_only']:
+                                self.mana_value_var.set(f"Mana: {mana_text['numbers_only']}")
+                            elif mana_text and 'full_text' in mana_text and mana_text['full_text']:
+                                self.mana_value_var.set(f"Mana: {mana_text['full_text']}")
+                            elif mana_text and 'default' in mana_text and mana_text['default']:
+                                self.mana_value_var.set(f"Mana: {mana_text['default']}")
+                            else:
+                                self.mana_value_var.set("Mana: --")
+
+                            print(f"Mana OCR wynik: {mana_text}")  # Debug
+                        except Exception as e:
+                            logging.error(f"Error updating Mana value: {e}")
+                            self.mana_value_var.set("Mana: Error")
+
         except Exception as e:
-            print(f"Błąd aktualizacji podglądu: {e}")
+            logging.error(f"Błąd aktualizacji podglądu: {e}")
 
         update_interval = 1000 // self.config['gui']['preview_fps']
         self.root.after(update_interval, self.update_preview)
 
-    def run(self):
-        """Uruchom aplikację"""
-
+    def debug_hp_mana_regions(self):
+        """Debug regionów HP i Mana - zapisuje obrazy do analizy"""
         try:
-            # Start automation if enabled
-            if self.config['automation']['enabled']:
-                self.automation.start()
-            from vision.vision_engine import VisionEngine
-            self.vision_engine = VisionEngine(self.config)
-            self.update_template_list()
-        except ImportError:
-            print("Vision Engine nie jest dostępny przy starcie - zostanie załadowany przy pierwszym użyciu")
+            screenshot = self.window_capture.capture_window_screenshot()
+            if screenshot is None:
+                print("Brak screenshota")
+                return
 
+            print(f"Screenshot size: {screenshot.shape}")
+
+            # Debug HP region
+            if hasattr(self, 'hp_region') and self.hp_region:
+                x, y, w, h = self.hp_region
+                print(f"HP region: ({x}, {y}, {w}, {h})")
+
+                # Sprawdź czy region mieści się w obrazie
+                img_height, img_width = screenshot.shape[:2]
+                if x + w <= img_width and y + h <= img_height and x >= 0 and y >= 0:
+                    hp_roi = screenshot[y:y + h, x:x + w]
+
+                    # Zapisz HP region
+                    debug_dir = os.path.join(self.config['paths']['screenshots'], 'debug')
+                    os.makedirs(debug_dir, exist_ok=True)
+                    timestamp = datetime.now().strftime('%H%M%S')
+
+                    hp_file = os.path.join(debug_dir, f'hp_region_{timestamp}.png')
+                    cv2.imwrite(hp_file, hp_roi)
+                    print(f"HP region zapisany: {hp_file}")
+                    print(f"HP region shape: {hp_roi.shape}")
+
+                    # Test OCR na HP
+                    hp_result = self.vision_engine.test_manual_ocr_region(screenshot, x, y, w, h)
+                    print(f"HP OCR result: {hp_result}")
+                else:
+                    print(f"HP region poza obrazem! Image: {img_width}x{img_height}")
+
+            # Debug Mana region
+            if hasattr(self, 'mana_region') and self.mana_region:
+                x, y, w, h = self.mana_region
+                print(f"Mana region: ({x}, {y}, {w}, {h})")
+
+                # Sprawdź czy region mieści się w obrazie
+                img_height, img_width = screenshot.shape[:2]
+                if x + w <= img_width and y + h <= img_height and x >= 0 and y >= 0:
+                    mana_roi = screenshot[y:y + h, x:x + w]
+
+                    # Zapisz Mana region
+                    debug_dir = os.path.join(self.config['paths']['screenshots'], 'debug')
+                    os.makedirs(debug_dir, exist_ok=True)
+                    timestamp = datetime.now().strftime('%H%M%S')
+
+                    mana_file = os.path.join(debug_dir, f'mana_region_{timestamp}.png')
+                    cv2.imwrite(mana_file, mana_roi)
+                    print(f"Mana region zapisany: {mana_file}")
+                    print(f"Mana region shape: {mana_roi.shape}")
+
+                    # Test OCR na Mana
+                    mana_result = self.vision_engine.test_manual_ocr_region(screenshot, x, y, w, h)
+                    print(f"Mana OCR result: {mana_result}")
+                else:
+                    print(f"Mana region poza obrazem! Image: {img_width}x{img_height}")
+
+            # Zapisz też pełny screenshot z zaznaczonymi regionami
+            vis_image = screenshot.copy()
+
+            if hasattr(self, 'hp_region') and self.hp_region:
+                x, y, w, h = self.hp_region
+                cv2.rectangle(vis_image, (x, y), (x + w, y + h), (0, 255, 0), 2)  # Zielony dla HP
+                cv2.putText(vis_image, "HP", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            if hasattr(self, 'mana_region') and self.mana_region:
+                x, y, w, h = self.mana_region
+                cv2.rectangle(vis_image, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Niebieski dla Mana
+                cv2.putText(vis_image, "MANA", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+            timestamp = datetime.now().strftime('%H%M%S')
+            vis_file = os.path.join(debug_dir, f'regions_overview_{timestamp}.png')
+            cv2.imwrite(vis_file, vis_image)
+            print(f"Regions overview zapisany: {vis_file}")
+
+        except Exception as e:
+            print(f"Błąd debug: {e}")
+
+    # Dodaj też przycisk w GUI do testowania
+    def add_debug_button_to_gui(self):
+        """Dodaj przycisk debug do GUI"""
+
+    def on_closing(self):
+        """Handle window closing"""
+        if self.capture_active:
+            self.stop_capture()
+        if hasattr(self, 'automation') and self.automation:
+            self.automation.stop()
+        self.root.destroy()
+
+    def run(self):
+        """Run the application"""
         self.root.mainloop()
-        self.stop_capture()
-        finally:
-            # Clean up
-            if self.automation:
-                self.automation.stop()

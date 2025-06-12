@@ -55,6 +55,7 @@ class WindowCapture:
         """Aktualizuj informacje o oknie"""
         if self.target_window:
             try:
+                # Get basic window info
                 self.window_info = {
                     'title': self.target_window.title,
                     'left': self.target_window.left,
@@ -64,8 +65,19 @@ class WindowCapture:
                     'right': self.target_window.right,
                     'bottom': self.target_window.bottom
                 }
+                
+                # Try to get window handle safely
+                try:
+                    if hasattr(self.target_window, '_hWnd'):
+                        self.window_info['handle'] = self.target_window._hWnd
+                    else:
+                        self.window_info['handle'] = None
+                except:
+                    self.window_info['handle'] = None
+                
                 self.coordinate_manager.update_window_info(self.window_info)
-            except:
+            except Exception as e:
+                print(f"Error updating window info: {e}")
                 self.window_info = {}
 
     def capture_window_screenshot(self) -> Optional[np.ndarray]:

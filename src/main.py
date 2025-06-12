@@ -2,12 +2,14 @@ import os
 import sys
 import json
 from pathlib import Path
+import tkinter as tk
 
 # Dodaj src do path
 src_path = Path(__file__).parent
 sys.path.insert(0, str(src_path))
 
 from gui.main_window import MainWindow
+from vision.vision_engine import VisionEngine
 
 
 def load_config():
@@ -51,45 +53,12 @@ def get_default_config():
             "window_height": 600
         },
         "paths": {
-            "screenshots": "data/screenshots",
-            "templates": "data/templates",
-            "models": "models",
-            "database": "data/training_data.db"
-        }
-    }
-
-def get_default_config():
-    """Domyślna konfiguracja"""
-    return {
-        "window": {
-            "target_titles": [
-                "WowClassic",
-                "World of Warcraft",
-                "World of Warcraft®",
-                "Retail"
-            ],
-            "capture_fps": 10,
-            "screenshot_format": "png"
-        },
-        "input": {
-            "click_delay": 0.1,
-            "safety_enabled": True,
-            "failsafe_enabled": True
-        },
-        "gui": {
-            "preview_fps": 5,
-            "preview_max_width": 400,
-            "preview_max_height": 300,
-            "window_width": 800,
-            "window_height": 600
-        },
-        "paths": {
+            "data": "data",
             "screenshots": "data/screenshots",
             "templates": "data/templates",
             "models": "models",
             "database": "data/training_data.db"
         },
-        # Add automation configuration
         "automation": {
             "enabled": True,
             "monitoring": {
@@ -113,16 +82,24 @@ def get_default_config():
             }
         }
     }
+
 def create_directories(config):
     """Utwórz potrzebne foldery"""
     base_path = src_path.parent
+
+    # Upewnij się, że ścieżka data istnieje
+    data_path = base_path / "data"
+    data_path.mkdir(parents=True, exist_ok=True)
+
+    # Dodaj ścieżkę data do konfiguracji jeśli jej brakuje
+    if 'data' not in config['paths']:
+        config['paths']['data'] = "data"
 
     directories = [
         config['paths']['screenshots'],
         config['paths']['templates'],
         config['paths']['models'],
-        "data",
-        "models/yolo",
+        "models/yolo_models",
         "models/custom",
         "tests"
     ]
@@ -133,29 +110,23 @@ def create_directories(config):
 
 
 def main():
-    """Główna funkcja aplikacji"""
+    """Main function"""
     print("WoW Automation - Krok 1: Podstawowe Przechwytywanie")
-    print("=" * 50)
+    print("==================================================")
 
-    # Załaduj konfigurację
+    # Load configuration
     config = load_config()
     print("✓ Konfiguracja załadowana")
 
-    # Utwórz potrzebne foldery
+    # Create required directories
     create_directories(config)
     print("✓ Foldery utworzone")
 
-    # Uruchom aplikację
-    try:
-        app = MainWindow(config)
-        print("✓ Aplikacja uruchomiona")
-        app.run()
-    except KeyboardInterrupt:
-        print("\nZatrzymano przez użytkownika")
-    except Exception as e:
-        print(f"Błąd aplikacji: {e}")
-        import traceback
-        traceback.print_exc()
+    # Create main window
+    app = MainWindow(config)
+
+    # Run application
+    app.run()
 
 
 if __name__ == "__main__":
